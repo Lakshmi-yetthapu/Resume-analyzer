@@ -9,3 +9,5 @@ openpyxl
 gdown
 gspread
 oauth2client
+tesseract-ocr
+tesseract-ocr-eng
