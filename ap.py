@@ -791,79 +791,96 @@ def extract_github_info_via_ai(resume_text: str, clickable_links: List[str], api
         return {"github_found": False, "github_url": None, "github_username": None}
 
 def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, Any]:
-    """Fetches and analyzes repositories against required tech stacks."""
+    """
+    ULTIMATE DEEP SCAN: Checks Languages (<1%), Topics, Descriptions, 
+    and scans dependency files (requirements.txt, package.json) for frameworks.
+    """
     if not username:
         return {"found": False, "matches": [], "error": "No username"}
 
-    # Validate and clean required_tech
-    if not required_tech or not isinstance(required_tech, str):
-        return {"found": False, "matches": [], "error": "No required tech specified"}
-    
-    headers = {}
-    # Use GITHUB_TOKEN from secrets if available to avoid rate limits
+    # Clean and split required tech (e.g., "Django, FastAPI" -> ['django', 'fastapi'])
+    tech_list = [t.strip().lower() for t in re.split(r'[,\s/]+', required_tech) if t.strip()]
+    if not tech_list:
+        return {"found": False, "matches": [], "error": "No tech stack provided"}
+
+    headers = {"Accept": "application/vnd.github.v3+json"}
     if "GITHUB_TOKEN" in st.secrets:
         headers["Authorization"] = f"token {st.secrets['GITHUB_TOKEN']}"
         
     try:
-        repo_resp = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100", headers=headers, timeout=15)
+        # 1. Fetch all public repos
+        repo_resp = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated", headers=headers, timeout=15)
         if repo_resp.status_code != 200:
-            logger.warning(f"GitHub API returned status {repo_resp.status_code} for user {username}")
             return {"found": False, "error": f"GitHub API Error: {repo_resp.status_code}"}
         
         repos = repo_resp.json()
         matched_repos = []
-        tech_list = [t.strip().lower() for t in required_tech.split(',') if t.strip()]
-        if not tech_list:
-            return {"found": False, "matches": [], "error": "No valid technologies provided"}
 
         for repo in repos:
-            repo_name = repo.get('name', '').lower()
-            desc = (repo.get('description') or '').lower()
-            lang = (repo.get('language') or '').lower()
+            repo_name = repo.get('name', '')
+            owner = repo.get('owner', {}).get('login')
+            description = (repo.get('description') or '').lower()
             topics = [t.lower() for t in repo.get('topics', [])]
             
-            # Check if repo metadata matches any required tech using word boundaries
-            matches_tech = False
-            for tech in tech_list:
-                tech_pattern = r'\b' + re.escape(tech) + r'\b'
-                if (re.search(tech_pattern, repo_name) or
-                    re.search(tech_pattern, desc) or
-                    re.search(tech_pattern, lang) or
-                    any(re.search(tech_pattern, topic) for topic in topics)):
-                    matches_tech = True
-                    break
+            # 2. Languages API (Finds the 1% matches)
+            lang_resp = requests.get(f"https://api.github.com/repos/{owner}/{repo_name}/languages", headers=headers, timeout=5)
+            repo_langs = [l.lower() for l in lang_resp.json().keys()] if lang_resp.status_code == 200 else []
             
-            if matches_tech:
-                # Verify Contribution via commits
-                verify_url = f"https://api.github.com/repos/{username}/{repo.get('name')}/commits?author={username}"
-                try:
-                    v_resp = requests.get(verify_url, headers=headers, timeout=10)
-                    is_verified = v_resp.status_code == 200 and len(v_resp.json()) > 0
-                except Exception as e:
-                    logger.warning(f"Could not verify commits for {repo.get('name')}: {e}")
-                    is_verified = False
+            # 3. Dependency File Scan (For Django, FastAPI, etc.)
+            # We look for key files in the root to identify frameworks
+            frameworks_detected = []
+            manifest_files = ['requirements.txt', 'package.json', 'pyproject.toml', 'go.mod']
+            
+            # To save API calls, we only scan files if the base language matches (e.g. Python for Django)
+            if any(lang in ['python', 'javascript', 'typescript', 'go'] for lang in repo_langs):
+                for file_name in manifest_files:
+                    file_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_name}"
+                    file_resp = requests.get(file_url, headers=headers, timeout=5)
+                    if file_resp.status_code == 200:
+                        # Extract text from the manifest file
+                        import base64
+                        try:
+                            content = base64.b64decode(file_resp.json().get('content', '')).decode('utf-8').lower()
+                            # Check if any of our required tech is inside the requirements/package file
+                            for tech in tech_list:
+                                if tech in content:
+                                    frameworks_detected.append(tech)
+                        except Exception:
+                            pass
+
+            # 4. Create the Search Blob
+            search_blob = f"{repo_name} {description} {' '.join(topics)} {' '.join(repo_langs)} {' '.join(frameworks_detected)}".lower()
+
+            # 5. Final Matching
+            matches_for_this_repo = []
+            for tech in tech_list:
+                pattern = r'\b' + re.escape(tech) + r'\b'
+                if re.search(pattern, search_blob):
+                    matches_for_this_repo.append(tech)
+
+            if matches_for_this_repo:
+                # 6. Verify Ownership/Commits
+                v_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits?author={username}&per_page=1"
+                v_resp = requests.get(v_url, headers=headers, timeout=5)
+                is_verified = (v_resp.status_code == 200 and len(v_resp.json()) > 0) or (owner.lower() == username.lower())
                 
                 if is_verified:
                     matched_repos.append({
-                        "name": repo.get('name'),
+                        "name": repo_name,
                         "url": repo.get('html_url'),
-                        "tech_detected": lang or "Multiple"
+                        "tech_detected": ", ".join(set(matches_for_this_repo)).title(),
+                        "details": "Matched via " + ("Files" if frameworks_detected else "Metadata")
                     })
 
         return {
-    "found": True,
-    "total_analyzed": len(repos),
-    "matches": matched_repos,
-    "match_count": len(matched_repos),
-    "commits_verified": len(matched_repos) > 0 # If matches exist, they were already verified in Gate 3
-    }
-    except requests.exceptions.RequestException as e:
-        logger.error(f"GitHub API request failed for user {username}: {e}")
-        return {"found": False, "error": f"API request failed: {str(e)}"}
+            "found": True,
+            "matches": matched_repos,
+            "match_count": len(matched_repos),
+            "commits_verified": len(matched_repos) > 0
+        }
     except Exception as e:
-        logger.error(f"Unexpected error analyzing GitHub repos for {username}: {e}")
         return {"found": False, "error": str(e)}
-
+    
 def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, **kwargs):
     """
     Worker for shortlisting. 
