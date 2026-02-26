@@ -27,7 +27,6 @@ from random import uniform
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-
 # ==============================================================================
 #  CONFIGURATION
 # ==============================================================================
@@ -60,7 +59,6 @@ if not MISTRAL_API_KEYS:
 MISTRAL_MODEL = "mistral-medium-latest"
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -68,7 +66,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-
 
 # ##############################################################################
 #  GOOGLE SHEETS CONFIGURATION
@@ -126,7 +123,6 @@ def get_or_create_worksheet(client, sheet_name, subsheet_name):
 #  END OF GOOGLE SHEETS CONFIGURATION
 # ##############################################################################
 
-
 # Skills configuration for analysis
 SKILLS_TO_ASSESS = [
     'JavaScript', 'Python', 'Node', 'React', 'Java', 'Springboot', 'DSA',
@@ -165,7 +161,6 @@ def get_internal_projects_as_string(file_path: str) -> str:
 INTERNAL_PROJECTS_STRING = get_internal_projects_as_string(INTERNAL_PROJECT_LIST_FILE)
 # ##############################################################################
 
-
 # ==============================================================================
 #  SESSION STATE INITIALIZATION
 # ==============================================================================
@@ -177,7 +172,6 @@ if 'last_analysis_mode' not in st.session_state:
     st.session_state.last_analysis_mode = ""
 if 'shortlisting_mode' not in st.session_state:
     st.session_state.shortlisting_mode = "Probability Wise (Default)"
-
 
 # ==============================================================================
 #  UTILS — SANITIZATION & SAFE OPS
@@ -198,6 +192,8 @@ def coerce_probability_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in SKILL_COLUMNS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+    if 'GitHub Probability' in df.columns:
+        df['GitHub Probability'] = pd.to_numeric(df['GitHub Probability'], errors='coerce').fillna(0).astype(int)
     return df
 
 def sanitize_json_text(text: str) -> str:
@@ -705,7 +701,6 @@ def assign_priority_band(probability: Any) -> str:
     elif 60 <= prob_numeric < 75: return 'P3'
     else: return 'Not Shortlisted'
 
-
 def calculate_skill_probabilities(data):
     scores = {column: 0 for column in SKILL_COLUMNS}
     if not isinstance(data, dict):
@@ -766,7 +761,110 @@ def calculate_skill_probabilities(data):
 #  MAIN WORKER FUNCTIONS
 # ==============================================================================
 
-def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key):
+# ==============================================================================
+#  GITHUB TECHNICAL SCREENING MODULE
+# ==============================================================================
+
+def extract_github_info_via_ai(resume_text: str, clickable_links: List[str], api_key: str) -> Dict[str, Any]:
+    """Uses AI to exhaustively find GitHub profiles from text, links, or portfolios."""
+    prompt = f"""
+    Analyze the following resume content and links to find the candidate's GitHub profile.
+    Candidates might provide a username, a full URL, or a link hidden in a portfolio site.
+    Ignore links ending in '.io' unless they are explicitly GitHub Pages (e.g., username.github.io).
+    
+    Resume Text: {resume_text}
+    Detected Links: {clickable_links}
+    
+    Return ONLY a JSON object:
+    {{
+      "github_found": boolean,
+      "github_url": "string or null",
+      "github_username": "string or null",
+      "reasoning": "string"
+    }}
+    """
+    response = analyze_text_with_mistral(prompt, api_key)
+    try:
+        return relaxed_json_loads(response)
+    except Exception as e:
+        logger.error(f"Error parsing GitHub info from AI response: {e}")
+        return {"github_found": False, "github_url": None, "github_username": None}
+
+def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, Any]:
+    """Fetches and analyzes repositories against required tech stacks."""
+    if not username:
+        return {"found": False, "matches": [], "error": "No username"}
+
+    # Validate and clean required_tech
+    if not required_tech or not isinstance(required_tech, str):
+        return {"found": False, "matches": [], "error": "No required tech specified"}
+    
+    headers = {}
+    # Use GITHUB_TOKEN from secrets if available to avoid rate limits
+    if "GITHUB_TOKEN" in st.secrets:
+        headers["Authorization"] = f"token {st.secrets['GITHUB_TOKEN']}"
+        
+    try:
+        repo_resp = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100", headers=headers, timeout=15)
+        if repo_resp.status_code != 200:
+            logger.warning(f"GitHub API returned status {repo_resp.status_code} for user {username}")
+            return {"found": False, "error": f"GitHub API Error: {repo_resp.status_code}"}
+        
+        repos = repo_resp.json()
+        matched_repos = []
+        tech_list = [t.strip().lower() for t in required_tech.split(',') if t.strip()]
+        if not tech_list:
+            return {"found": False, "matches": [], "error": "No valid technologies provided"}
+
+        for repo in repos:
+            repo_name = repo.get('name', '').lower()
+            desc = (repo.get('description') or '').lower()
+            lang = (repo.get('language') or '').lower()
+            topics = [t.lower() for t in repo.get('topics', [])]
+            
+            # Check if repo metadata matches any required tech using word boundaries
+            matches_tech = False
+            for tech in tech_list:
+                tech_pattern = r'\b' + re.escape(tech) + r'\b'
+                if (re.search(tech_pattern, repo_name) or
+                    re.search(tech_pattern, desc) or
+                    re.search(tech_pattern, lang) or
+                    any(re.search(tech_pattern, topic) for topic in topics)):
+                    matches_tech = True
+                    break
+            
+            if matches_tech:
+                # Verify Contribution via commits
+                verify_url = f"https://api.github.com/repos/{username}/{repo.get('name')}/commits?author={username}"
+                try:
+                    v_resp = requests.get(verify_url, headers=headers, timeout=10)
+                    is_verified = v_resp.status_code == 200 and len(v_resp.json()) > 0
+                except Exception as e:
+                    logger.warning(f"Could not verify commits for {repo.get('name')}: {e}")
+                    is_verified = False
+                
+                if is_verified:
+                    matched_repos.append({
+                        "name": repo.get('name'),
+                        "url": repo.get('html_url'),
+                        "tech_detected": lang or "Multiple"
+                    })
+
+        return {
+    "found": True,
+    "total_analyzed": len(repos),
+    "matches": matched_repos,
+    "match_count": len(matched_repos),
+    "commits_verified": len(matched_repos) > 0 # If matches exist, they were already verified in Gate 3
+    }
+    except requests.exceptions.RequestException as e:
+        logger.error(f"GitHub API request failed for user {username}: {e}")
+        return {"found": False, "error": f"API request failed: {str(e)}"}
+    except Exception as e:
+        logger.error(f"Unexpected error analyzing GitHub repos for {username}: {e}")
+        return {"found": False, "error": str(e)}
+
+def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, **kwargs):
     """
     Worker for shortlisting. 
     Includes STRICT Python-based Keyword Validation to prevent "JavaScript" == "Java" confusion.
@@ -802,7 +900,7 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
             raise ValueError(f"Download Error: {msg_or_path}")
 
         if file_type == 'pdf':
-            resume_text, _ = extract_text_and_urls_from_pdf(temp_file_path)
+            resume_text, clickable_links = extract_text_and_urls_from_pdf(temp_file_path)
         elif file_type in ['png', 'jpeg']:
             resume_text, _ = extract_text_from_image(temp_file_path)
         else:
@@ -846,8 +944,7 @@ Your goal is to categorize the candidate into Priority Bands (P1, P2, P3) based 
 {system_warning}
 
 **CRITICAL ANTI-HALLUCINATION RULES:**
-1. **JAVA IS NOT JAVASCRIPT.** 
-   - If the resume contains "JavaScript", "ECMAScript", or "React.js", DO NOT count this as "Java".
+1. **JAVA IS NOT JAVASCRIPT.** - If the resume contains "JavaScript", "ECMAScript", or "React.js", DO NOT count this as "Java".
    - "Java" is a standalone backend language. "JavaScript" is a frontend language.
    - If the candidate lists "JavaScript Essentials" certification, that is **NOT** Java.
    - If the resume text does not explicitly say "Java" as a separate word, count it as MISSING.
@@ -926,6 +1023,37 @@ Return your answer as a **single, pure JSON object**.
         classified_projects = classify_and_format_projects_from_ai(projects_data)
         result.update(classified_projects)
 
+        # --- ENHANCED GITHUB SCREENING INTEGRATION ---
+        github_skills_input = kwargs.get('github_skills', '')
+        gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
+        
+        # Initialize default value for the new column
+        result['GitHub Probability'] = 0
+        
+        if gh_info.get("github_found") and gh_info.get("github_username"):
+            analysis_criteria = github_skills_input if github_skills_input.strip() else user_requirements
+            gh_analysis = analyze_github_repositories(gh_info["github_username"], analysis_criteria)
+            
+            # --- UPDATED PROBABILITY LOGIC ---
+            # If any verified matches exist, score is 100
+            if gh_analysis.get("commits_verified"):
+                result['GitHub Probability'] = 100
+                result['Commit Ownership Verified'] = "Yes — commits made by the user"
+            else:
+                result['GitHub Probability'] = 0
+                result['Commit Ownership Verified'] = "No — no commits by the user"
+
+            result['GitHub Screening Outcome'] = "Verified Matches Found" if gh_analysis.get("match_count", 0) > 0 else "No Matching Tech Found"
+            result['Verified GitHub Repos'] = "\n".join([f"{r['name']} ({r['tech_detected']})" for r in gh_analysis.get("matches", [])])
+            result['GitHub Profile Used'] = gh_info.get("github_url")
+        else:
+            result['GitHub Screening Outcome'] = "Profile Not Found"
+            result['Verified GitHub Repos'] = "N/A"
+            result['GitHub Profile Used'] = "None"
+            result['GitHub Probability'] = 0
+            result['Commit Ownership Verified'] = "No — no profile found"
+        # ----------------------------------------------
+
         internal_titles_str = classified_projects.get('Internal Project Title', '')
         external_titles_str = classified_projects.get('External Project Title', '')
         internal_count = len(internal_titles_str.splitlines()) if internal_titles_str else 0
@@ -947,7 +1075,6 @@ Return your answer as a **single, pure JSON object**.
                 logger.error(f"Error removing temporary file {temp_file_path}: {e}")
 
     return result
-
 
 def process_resume_comprehensively(row, resume_index, analysis_type, company_name, api_key):
     """Worker for comprehensive data extraction with AI-driven project classification."""
@@ -1393,6 +1520,12 @@ def main():
                     placeholder="e.g., Acme Corporation",
                     help="This name is required to identify the analysis batch and will be saved with the results."
                 )
+                # NEW DYNAMIC GITHUB SKILLS INPUT
+                github_skills = st.text_input(
+                    "Enter Required Skills for GitHub Analysis",
+                    placeholder="e.g., Python, TensorFlow, Docker",
+                    help="GitHub repositories will be evaluated specifically against these technologies. If left blank, the main Job Description will be used."
+                )
 
                 if user_requirements.strip():
                     st.info("**Mode:** Priority-Based Shortlisting (Focused Analysis)")
@@ -1445,11 +1578,15 @@ def main():
                         
                         display_columns = [
                             'User ID', 'Resume Link', 'Overall Probability', 'Overall Remarks',
-                            'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
-                            'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
-                            'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-                            'Internal Project Title', 'Internal Projects Techstacks',
-                            'External Project Title', 'External Projects Techstacks'
+    'GitHub Screening Outcome', 'GitHub Profile Used', 
+    'Commit Ownership Verified', # NEW COLUMN
+    'GitHub Probability', 
+    'Verified GitHub Repos',
+    'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
+    'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
+    'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
+    'Internal Project Title', 'Internal Projects Techstacks',
+    'External Project Title', 'External Projects Techstacks'
                         ]
 
                         if st.session_state.shortlisting_mode == "Priority Wise (P1 / P2 / P3 Bands)":
@@ -1457,7 +1594,8 @@ def main():
 
                         process_resumes_in_batches_live(
                             df=df_input, batch_size=st.session_state.batch_size, worker_function=process_resume_for_shortlisting,
-                            display_columns=display_columns, user_requirements=user_requirements.strip(), company_name=company_name.strip()
+                            display_columns=display_columns, user_requirements=user_requirements.strip(), company_name=company_name.strip(),
+                            github_skills=github_skills.strip() # ADDED THIS LINE
                         )
                     else:
                         st.session_state.last_analysis_mode = analysis_type
@@ -1510,11 +1648,14 @@ def main():
             
             base_display_cols = [
                 'User ID', 'Resume Link', 'Overall Probability', 'Overall Remarks',
-                'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
-                'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
-                'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-                'Internal Project Title', 'Internal Projects Techstacks',
-                'External Project Title', 'External Projects Techstacks'
+    'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
+    'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
+    'GitHub Profile Used', 
+    'Commit Ownership Verified', # NEW COLUMN
+    'GitHub Probability', 
+    'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
+    'Internal Project Title', 'Internal Projects Techstacks',
+    'External Project Title', 'External Projects Techstacks'
             ]
 
             if st.session_state.get('shortlisting_mode') == "Priority Wise (P1 / P2 / P3 Bands)":

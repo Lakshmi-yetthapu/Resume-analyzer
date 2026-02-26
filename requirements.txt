@@ -1,3 +1,4 @@
+# Existing Dependencies
 streamlit
 pandas
 pillow
@@ -9,5 +10,12 @@ openpyxl
 gdown
 gspread
 oauth2client
-tesseract-ocr
-tesseract-ocr-eng
+
+# New/Required for GitHub Screening & Robustness
+urllib3
+typing-extensions
+
+# System-level dependencies (Note: these are usually installed via apt-get, not pip,
+# but kept here for your reference as per your list)
+# tesseract-ocr
+# tesseract-ocr-eng
