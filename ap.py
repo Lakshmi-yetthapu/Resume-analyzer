@@ -790,31 +790,124 @@ def extract_github_info_via_ai(resume_text: str, clickable_links: List[str], api
         logger.error(f"Error parsing GitHub info from AI response: {e}")
         return {"github_found": False, "github_url": None, "github_username": None}
 
+# def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, Any]:
+#     """
+#     ULTIMATE DEEP SCAN: Checks Languages (<1%), Topics, Descriptions, 
+#     and scans dependency files (requirements.txt, package.json) for frameworks.
+#     """
+#     if not username:
+#         return {"found": False, "matches": [], "error": "No username"}
+
+#     # Clean and split required tech (e.g., "Django, FastAPI" -> ['django', 'fastapi'])
+#     tech_list = [t.strip().lower() for t in re.split(r'[,\s/]+', required_tech) if t.strip()]
+#     if not tech_list:
+#         return {"found": False, "matches": [], "error": "No tech stack provided"}
+
+#     headers = {"Accept": "application/vnd.github.v3+json"}
+#     if "GITHUB_TOKEN" in st.secrets:
+#         headers["Authorization"] = f"token {st.secrets['GITHUB_TOKEN']}"
+        
+#     try:
+#         # 1. Fetch all public repos
+#         repo_resp = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated", headers=headers, timeout=15)
+#         if repo_resp.status_code != 200:
+#             return {"found": False, "error": f"GitHub API Error: {repo_resp.status_code}"}
+        
+#         repos = repo_resp.json()
+#         matched_repos = []
+
+#         for repo in repos:
+#             repo_name = repo.get('name', '')
+#             owner = repo.get('owner', {}).get('login')
+#             description = (repo.get('description') or '').lower()
+#             topics = [t.lower() for t in repo.get('topics', [])]
+            
+#             # 2. Languages API (Finds the 1% matches)
+#             lang_resp = requests.get(f"https://api.github.com/repos/{owner}/{repo_name}/languages", headers=headers, timeout=5)
+#             repo_langs = [l.lower() for l in lang_resp.json().keys()] if lang_resp.status_code == 200 else []
+            
+#             # 3. Dependency File Scan (For Django, FastAPI, etc.)
+#             # We look for key files in the root to identify frameworks
+#             frameworks_detected = []
+#             manifest_files = ['requirements.txt', 'package.json', 'pyproject.toml', 'go.mod']
+            
+#             # To save API calls, we only scan files if the base language matches (e.g. Python for Django)
+#             if any(lang in ['python', 'javascript', 'typescript', 'go'] for lang in repo_langs):
+#                 for file_name in manifest_files:
+#                     file_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_name}"
+#                     file_resp = requests.get(file_url, headers=headers, timeout=5)
+#                     if file_resp.status_code == 200:
+#                         # Extract text from the manifest file
+#                         import base64
+#                         try:
+#                             content = base64.b64decode(file_resp.json().get('content', '')).decode('utf-8').lower()
+#                             # Check if any of our required tech is inside the requirements/package file
+#                             for tech in tech_list:
+#                                 if tech in content:
+#                                     frameworks_detected.append(tech)
+#                         except Exception:
+#                             pass
+
+#             # 4. Create the Search Blob
+#             search_blob = f"{repo_name} {description} {' '.join(topics)} {' '.join(repo_langs)} {' '.join(frameworks_detected)}".lower()
+
+#             # 5. Final Matching
+#             matches_for_this_repo = []
+#             for tech in tech_list:
+#                 pattern = r'\b' + re.escape(tech) + r'\b'
+#                 if re.search(pattern, search_blob):
+#                     matches_for_this_repo.append(tech)
+
+#             if matches_for_this_repo:
+#                 # 6. Verify Ownership/Commits
+#                 v_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits?author={username}&per_page=1"
+#                 v_resp = requests.get(v_url, headers=headers, timeout=5)
+#                 is_verified = (v_resp.status_code == 200 and len(v_resp.json()) > 0) or (owner.lower() == username.lower())
+                
+#                 if is_verified:
+#                     matched_repos.append({
+#                         "name": repo_name,
+#                         "url": repo.get('html_url'),
+#                         "tech_detected": ", ".join(set(matches_for_this_repo)).title(),
+#                         "details": "Matched via " + ("Files" if frameworks_detected else "Metadata")
+#                     })
+
+#         return {
+#             "found": True,
+#             "matches": matched_repos,
+#             "match_count": len(matched_repos),
+#             "commits_verified": len(matched_repos) > 0
+#         }
+#     except Exception as e:
+#         return {"found": False, "error": str(e)}
+
 def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, Any]:
     """
-    ULTIMATE DEEP SCAN: Checks Languages (<1%), Topics, Descriptions, 
-    and scans dependency files (requirements.txt, package.json) for frameworks.
+    Analyzes repositories for individual tech stacks. 
+    Assigns 100 per stack if found, then averages the total.
     """
     if not username:
-        return {"found": False, "matches": [], "error": "No username"}
+        return {"found": False, "error": "No username"}
 
-    # Clean and split required tech (e.g., "Django, FastAPI" -> ['django', 'fastapi'])
+    # Split tech stacks by common delimiters
     tech_list = [t.strip().lower() for t in re.split(r'[,\s/]+', required_tech) if t.strip()]
     if not tech_list:
-        return {"found": False, "matches": [], "error": "No tech stack provided"}
+        return {"found": False, "error": "No tech stack provided"}
 
+    # Result structure for individual tech tracking
+    tech_results = {tech: {"score": 0, "projects": []} for tech in tech_list}
+    
     headers = {"Accept": "application/vnd.github.v3+json"}
     if "GITHUB_TOKEN" in st.secrets:
         headers["Authorization"] = f"token {st.secrets['GITHUB_TOKEN']}"
         
     try:
-        # 1. Fetch all public repos
+        # Fetch repos sorted by recent activity
         repo_resp = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated", headers=headers, timeout=15)
         if repo_resp.status_code != 200:
             return {"found": False, "error": f"GitHub API Error: {repo_resp.status_code}"}
         
         repos = repo_resp.json()
-        matched_repos = []
 
         for repo in repos:
             repo_name = repo.get('name', '')
@@ -822,65 +915,62 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
             description = (repo.get('description') or '').lower()
             topics = [t.lower() for t in repo.get('topics', [])]
             
-            # 2. Languages API (Finds the 1% matches)
+            # Languages API for high-precision detection
             lang_resp = requests.get(f"https://api.github.com/repos/{owner}/{repo_name}/languages", headers=headers, timeout=5)
             repo_langs = [l.lower() for l in lang_resp.json().keys()] if lang_resp.status_code == 200 else []
             
-            # 3. Dependency File Scan (For Django, FastAPI, etc.)
-            # We look for key files in the root to identify frameworks
+            # Manifest/Dependency Scanning
             frameworks_detected = []
-            manifest_files = ['requirements.txt', 'package.json', 'pyproject.toml', 'go.mod']
+            manifest_files = ['package.json', 'requirements.txt', 'pyproject.toml', 'pom.xml', 'go.mod', 'Cargo.toml', 'Web.config']
             
-            # To save API calls, we only scan files if the base language matches (e.g. Python for Django)
-            if any(lang in ['python', 'javascript', 'typescript', 'go'] for lang in repo_langs):
+            # Only scan files if relevant languages are detected to save API calls
+            if any(l in ['javascript', 'typescript', 'python', 'java', 'c#', 'rust', 'go'] for l in repo_langs):
                 for file_name in manifest_files:
-                    file_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_name}"
-                    file_resp = requests.get(file_url, headers=headers, timeout=5)
-                    if file_resp.status_code == 200:
-                        # Extract text from the manifest file
+                    f_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_name}"
+                    f_resp = requests.get(f_url, headers=headers, timeout=5)
+                    if f_resp.status_code == 200:
                         import base64
                         try:
-                            content = base64.b64decode(file_resp.json().get('content', '')).decode('utf-8').lower()
-                            # Check if any of our required tech is inside the requirements/package file
+                            content = base64.b64decode(f_resp.json().get('content', '') + "===").decode('utf-8').lower()
                             for tech in tech_list:
-                                if tech in content:
-                                    frameworks_detected.append(tech)
-                        except Exception:
-                            pass
+                                if tech in content: frameworks_detected.append(tech)
+                        except: pass
 
-            # 4. Create the Search Blob
+            # Aggregate all metadata for search
             search_blob = f"{repo_name} {description} {' '.join(topics)} {' '.join(repo_langs)} {' '.join(frameworks_detected)}".lower()
 
-            # 5. Final Matching
-            matches_for_this_repo = []
             for tech in tech_list:
+                # Use regex with word boundaries for precision
                 pattern = r'\b' + re.escape(tech) + r'\b'
-                if re.search(pattern, search_blob):
-                    matches_for_this_repo.append(tech)
+                if tech == '.net': pattern = r'(?i)\.net\b' # Special case for .NET
 
-            if matches_for_this_repo:
-                # 6. Verify Ownership/Commits
-                v_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits?author={username}&per_page=1"
-                v_resp = requests.get(v_url, headers=headers, timeout=5)
-                is_verified = (v_resp.status_code == 200 and len(v_resp.json()) > 0) or (owner.lower() == username.lower())
-                
-                if is_verified:
-                    matched_repos.append({
-                        "name": repo_name,
-                        "url": repo.get('html_url'),
-                        "tech_detected": ", ".join(set(matches_for_this_repo)).title(),
-                        "details": "Matched via " + ("Files" if frameworks_detected else "Metadata")
-                    })
+                if re.search(pattern, search_blob):
+                    # Gate: Verify Ownership/Commits
+                    v_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits?author={username}&per_page=1"
+                    v_resp = requests.get(v_url, headers=headers, timeout=5)
+                    is_verified = (v_resp.status_code == 200 and len(v_resp.json()) > 0) or (owner.lower() == username.lower())
+                    
+                    if is_verified:
+                        tech_results[tech]["score"] = 100
+                        proj_entry = f"{repo_name} ({repo.get('language', 'Framework')})"
+                        if proj_entry not in tech_results[tech]["projects"]:
+                            tech_results[tech]["projects"].append(proj_entry)
+
+        # Calculate Final Average Score
+        all_scores = [data["score"] for data in tech_results.values()]
+        avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
 
         return {
             "found": True,
-            "matches": matched_repos,
-            "match_count": len(matched_repos),
-            "commits_verified": len(matched_repos) > 0
+            "tech_details": tech_results,
+            "github_average_probability": int(avg_score),
+            "match_count": sum(1 for d in tech_results.values() if d["score"] > 0),
+            "commits_verified": any(d["score"] > 0 for d in tech_results.values())
         }
     except Exception as e:
         return {"found": False, "error": str(e)}
     
+
 def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, **kwargs):
     """
     Worker for shortlisting. 
@@ -1043,32 +1133,46 @@ Return your answer as a **single, pure JSON object**.
         # --- ENHANCED GITHUB SCREENING INTEGRATION ---
         github_skills_input = kwargs.get('github_skills', '')
         gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
+
+        analysis_criteria = github_skills_input if github_skills_input.strip() else user_requirements
+        
+        # Prepare a list of expected tech for column initialization (prevents empty column errors)
+        input_techs = [t.strip().lower() for t in re.split(r'[,\s/]+', analysis_criteria) if t.strip()]
         
         # Initialize default value for the new column
         result['GitHub Probability'] = 0
         
+        # Inside process_resume_for_shortlisting, replace the GitHub logic section:
+
         if gh_info.get("github_found") and gh_info.get("github_username"):
-            analysis_criteria = github_skills_input if github_skills_input.strip() else user_requirements
             gh_analysis = analyze_github_repositories(gh_info["github_username"], analysis_criteria)
             
-            # --- UPDATED PROBABILITY LOGIC ---
-            # If any verified matches exist, score is 100
-            if gh_analysis.get("commits_verified"):
-                result['GitHub Probability'] = 100
-                result['Commit Ownership Verified'] = "Yes — commits made by the user"
+            if gh_analysis.get("found"):
+                details = gh_analysis.get("tech_details", {})
+                # Dynamically create columns for EACH tech stack requested
+                for tech, data in details.items():
+                    col_prefix = tech.upper()
+                    # Populating the dynamic columns
+                    result[f"{col_prefix}_Projects"] = "\n".join(data["projects"]) if data["projects"] else "N/A"
+                    result[f"{col_prefix}_Score"] = data["score"]
+                
+                result['GitHub Average Probability'] = gh_analysis.get("github_average_probability", 0)
+                result['GitHub Screening Outcome'] = "Analysis Complete"
+                result['Commit Ownership Verified'] = "Yes (Verified)" if gh_analysis.get("commits_verified") else "No"
             else:
-                result['GitHub Probability'] = 0
-                result['Commit Ownership Verified'] = "No — no commits by the user"
+                result['GitHub Average Probability'] = 0
+                result['GitHub Screening Outcome'] = gh_analysis.get("error", "Error")
 
-            result['GitHub Screening Outcome'] = "Verified Matches Found" if gh_analysis.get("match_count", 0) > 0 else "No Matching Tech Found"
-            result['Verified GitHub Repos'] = "\n".join([f"{r['name']} ({r['tech_detected']})" for r in gh_analysis.get("matches", [])])
             result['GitHub Profile Used'] = gh_info.get("github_url")
         else:
+            # Handle case where GitHub profile was not found at all
             result['GitHub Screening Outcome'] = "Profile Not Found"
-            result['Verified GitHub Repos'] = "N/A"
             result['GitHub Profile Used'] = "None"
-            result['GitHub Probability'] = 0
-            result['Commit Ownership Verified'] = "No — no profile found"
+            result['GitHub Average Probability'] = 0
+            result['Commit Ownership Verified'] = "N/A"
+            for tech in input_techs:
+                result[f"{tech.upper()}_Projects"] = "N/A"
+                result[f"{tech.upper()}_Score"] = 0
         # ----------------------------------------------
 
         internal_titles_str = classified_projects.get('Internal Project Title', '')
@@ -1590,31 +1694,74 @@ def main():
                 st.session_state.analysis_running = True
                 with live_results_container:
                     if user_requirements.strip():
+                        # --- 1. SET MODE ---
                         st.session_state.last_analysis_mode = "shortlisting"
                         st.session_state.shortlisting_mode = shortlisting_mode
+
+                        # --- 2. GENERATE DYNAMIC TECH COLUMNS ---
+                        # Use github_skills if provided, otherwise fallback to requirements
+                        analysis_criteria = github_skills.strip() if github_skills.strip() else user_requirements.strip()
+                        input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', analysis_criteria) if t.strip()]
                         
+                        dynamic_gh_cols = []
+                        for tech in input_techs:
+                            dynamic_gh_cols.append(f"{tech}_Projects")
+                            dynamic_gh_cols.append(f"{tech}_Score")
+
+                        # --- 3. DEFINE COLUMN ORDER STRICTLY AS REQUESTED ---
                         display_columns = [
-                            'User ID', 'Resume Link', 'Overall Probability', 'Overall Remarks',
-    'GitHub Screening Outcome', 'GitHub Profile Used', 
-    'Commit Ownership Verified', # NEW COLUMN
-    'GitHub Probability', 
-    'Verified GitHub Repos',
-    'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
-    'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
-    'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-    'Internal Project Title', 'Internal Projects Techstacks',
-    'External Project Title', 'External Projects Techstacks'
+                            'User ID', 
+                            'Resume Link', 
+                            'Overall Probability'
+                        ]
+                        
+                        # Inject Priority Band if the mode is selected
+                        if st.session_state.shortlisting_mode == "Priority Wise (P1 / P2 / P3 Bands)":
+                            display_columns.append('Priority Band')
+
+                        # High-level Summary and GitHub Metadata
+                        display_columns += [
+                            'Overall Remarks',
+                            'GitHub Screening Outcome',
+                            'GitHub Profile Used',
+                            'Commit Ownership Verified'
+                        ]
+                        
+                        # Inject the n-number of dynamic tech stacks (Name_Projects, Name_Score)
+                        display_columns += dynamic_gh_cols
+                        
+                        # GitHub Average and Detailed Resume Analysis Probabilities
+                        display_columns += [
+                            'GitHub Average Probability',
+                            'Projects Probability', 
+                            'Projects Remarks', 
+                            'Skills Probability', 
+                            'Skills Remarks', 
+                            'Experience Probability', 
+                            'Experience Remarks', 
+                            'Other Probability', 
+                            'Other Remarks',
+                            'Total Projects Count', 
+                            'Internal Projects Count', 
+                            'External Projects Count',
+                            'Internal Project Title', 
+                            'Internal Projects Techstacks',
+                            'External Project Title',
+                            'External Projects Techstacks'
                         ]
 
-                        if st.session_state.shortlisting_mode == "Priority Wise (P1 / P2 / P3 Bands)":
-                            display_columns.insert(3, 'Priority Band')
-
+                        # --- 4. RUN SHORTLISTING PROCESS ---
                         process_resumes_in_batches_live(
-                            df=df_input, batch_size=st.session_state.batch_size, worker_function=process_resume_for_shortlisting,
-                            display_columns=display_columns, user_requirements=user_requirements.strip(), company_name=company_name.strip(),
-                            github_skills=github_skills.strip() # ADDED THIS LINE
+                            df=df_input, 
+                            batch_size=st.session_state.batch_size, 
+                            worker_function=process_resume_for_shortlisting,
+                            display_columns=display_columns, 
+                            user_requirements=user_requirements.strip(), 
+                            company_name=company_name.strip(),
+                            github_skills=github_skills.strip()
                         )
                     else:
+                        # --- 5. COMPREHENSIVE EXTRACTION MODE (If Requirements Empty) ---
                         st.session_state.last_analysis_mode = analysis_type
 
                         if analysis_type == "Internal Projects Matching":
@@ -1624,6 +1771,7 @@ def main():
                                 'External Project Titles', 'External Project Techstacks'
                             ]
                         else:
+                            # Standard All Data / Personal Details / Skills extraction
                             all_extraction_columns = [
                                 'User ID', 'Resume Link', 'Full Name', 'Mobile Number', 'Email ID',
                                 'LinkedIn Link', 'GitHub Link', 'GitHub Repo Count', 'Other Links', 'City', 'State',
@@ -1639,15 +1787,16 @@ def main():
                             ]
                             display_columns = all_extraction_columns
 
+                        # RUN COMPREHENSIVE PROCESS
                         process_resumes_in_batches_live(
-                            df=df_input, batch_size=st.session_state.batch_size,
+                            df=df_input, 
+                            batch_size=st.session_state.batch_size,
                             worker_function=process_resume_comprehensively,
                             display_columns=display_columns,
                             analysis_type=analysis_type,
                             company_name=company_name.strip()
                         )
                 st.session_state.analysis_running = False
-
     if st.session_state.comprehensive_results:
         st.markdown("---")
         
