@@ -32,25 +32,19 @@ from oauth2client.service_account import ServiceAccountCredentials
 # ==============================================================================
 
 # NEW: DYNAMICALLY READ UP TO 10 API KEYS
-# This loop checks for MISTRAL_API_KEY_1, MISTRAL_API_KEY_2, ... up to 10.
 MISTRAL_API_KEYS = []
 
-# Try to load keys from Streamlit secrets or Environment Variables
 for i in range(1, 13):
     key_name = f"MISTRAL_API_KEY_{i}"
     try:
-        # Check secrets.toml first
         key = st.secrets.get(key_name)
-        # If not in secrets, check OS environment
         if not key:
             key = os.getenv(key_name)
-        
         if key:
             MISTRAL_API_KEYS.append(key)
     except (AttributeError, KeyError):
         pass
 
-# If no numbered keys found, try looking for a single unnumbered key
 if not MISTRAL_API_KEYS:
     single_key = os.getenv("MISTRAL_API_KEY")
     if single_key:
@@ -71,18 +65,15 @@ logger = logging.getLogger(__name__)
 #  GOOGLE SHEETS CONFIGURATION
 # ##############################################################################
 
-# Replace with the name of the Google Sheet you created and shared.
 GSHEET_NAME = "AI Resume Analysis Results"
 
 @st.cache_resource
 def get_gspread_client():
-    """Initializes and returns a gspread client, caching it for performance."""
     try:
         scope = [
             'https://spreadsheets.google.com/feeds',
             'https://www.googleapis.com/auth/drive'
         ]
-        # Load credentials safely from secrets
         if "gcp_service_account" in st.secrets:
             creds = ServiceAccountCredentials.from_json_keyfile_dict(
                 st.secrets["gcp_service_account"], scope
@@ -99,7 +90,6 @@ def get_gspread_client():
         return None
 
 def get_or_create_worksheet(client, sheet_name, subsheet_name):
-    """Gets a subsheet (worksheet) by name, creating it if it doesn't exist."""
     if not client:
         return None
     try:
@@ -123,43 +113,26 @@ def get_or_create_worksheet(client, sheet_name, subsheet_name):
 #  END OF GOOGLE SHEETS CONFIGURATION
 # ##############################################################################
 
-# Skills configuration for analysis
 SKILLS_TO_ASSESS = [
     'JavaScript', 'Python', 'Node', 'React', 'Java', 'Springboot', 'DSA',
     'AI', 'ML', 'PHP', '.Net', 'Testing', 'AWS', 'Django', 'PowerBI', 'Tableau'
 ]
 SKILL_COLUMNS = [f'{skill}_Probability' for skill in SKILLS_TO_ASSESS]
 
-# ##############################################################################
-#  AI-DRIVEN PROJECT CLASSIFICATION
-# ##############################################################################
 INTERNAL_PROJECT_LIST_FILE = "INTERNAL_PROJECT_LIST.txt"
 
 @st.cache_data
 def get_internal_projects_as_string(file_path: str) -> str:
-    """
-    Loads internal project names from a text file and returns them as a single
-    comma-separated string, suitable for embedding in an AI prompt. This is cached.
-    """
     if not os.path.exists(file_path):
-        logger.warning(
-            f'"{file_path}" not found. '
-            'Cannot classify internal projects. AI will treat all projects as "External".'
-        )
         return ""
-
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             projects = [line.strip() for line in f if line.strip()]
-        logger.info(f"Successfully loaded {len(projects)} internal project names for AI prompt.")
         return ", ".join(projects)
     except Exception as e:
-        logger.error(f"Error reading {file_path}: {e}. All projects will be treated as 'External'.")
         return ""
 
-# Get the project list once at the start.
 INTERNAL_PROJECTS_STRING = get_internal_projects_as_string(INTERNAL_PROJECT_LIST_FILE)
-# ##############################################################################
 
 # ==============================================================================
 #  SESSION STATE INITIALIZATION
@@ -180,7 +153,6 @@ if 'shortlisting_mode' not in st.session_state:
 CONTROL_CHARS_RE = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 
 def safe_str(x: Any) -> str:
-    """Convert any value to a clean string without control characters."""
     try:
         s = str(x)
     except Exception:
@@ -188,22 +160,14 @@ def safe_str(x: Any) -> str:
     return CONTROL_CHARS_RE.sub('', s)
 
 def coerce_probability_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure all probability columns are valid ints (Arrow-friendly)."""
     for col in SKILL_COLUMNS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-    if 'GitHub Probability' in df.columns:
-        df['GitHub Probability'] = pd.to_numeric(df['GitHub Probability'], errors='coerce').fillna(0).astype(int)
+    if 'GitHub Average Probability' in df.columns:
+        df['GitHub Average Probability'] = pd.to_numeric(df['GitHub Average Probability'], errors='coerce').fillna(0).astype(int)
     return df
 
 def sanitize_json_text(text: str) -> str:
-    """
-    Cleans model JSON by:
-    1. Removing markdown fences and any surrounding conversational text.
-    2. Isolating the core JSON object or array.
-    3. Removing control characters and escaping invalid backslashes.
-    4. Attempting to fix truncation errors.
-    """
     if not isinstance(text, str):
         text = str(text)
     text = text.strip()
@@ -213,7 +177,6 @@ def sanitize_json_text(text: str) -> str:
 
     start_pos = -1
     if first_brace == -1 and first_bracket == -1:
-        logger.warning("Could not find a JSON start '{' or '[' in the AI response.")
         return '{"error": "No valid JSON object or array found in response"}'
 
     if first_brace != -1 and first_bracket != -1:
@@ -228,13 +191,10 @@ def sanitize_json_text(text: str) -> str:
     end_pos = max(last_brace, last_bracket)
 
     if end_pos < start_pos:
-        logger.warning("Could not find a valid JSON structure {{...}} or [...] in the AI response.")
         return '{"error": "No valid JSON structure found in response"}'
 
     text = text[start_pos : end_pos + 1]
-
     text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
-
     text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
 
     if text.count('"') % 2 != 0:
@@ -251,27 +211,13 @@ def sanitize_json_text(text: str) -> str:
     return text
 
 def relaxed_json_loads(text: str) -> dict:
-    """
-    Parses JSON robustly by first calling a powerful sanitization function.
-    """
     sanitized_text = sanitize_json_text(text)
     try:
         return json.loads(sanitized_text)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing failed even after sanitization: {e}")
-        logger.debug(f"--- Sanitized text that failed parsing ---\n{sanitized_text}\n-----------------------------")
         raise
 
-def safe_join_texts(items: Any) -> str:
-    """
-    Join a list-like into a string; if not list-like, stringify safely.
-    """
-    if isinstance(items, list):
-        return " ".join(safe_str(x) for x in items)
-    return safe_str(items)
-
 def is_present_str(s: Any) -> bool:
-    """Check if a value indicates current/present in a forgiving way."""
     if s is None:
         return False
     return 'present' in safe_str(s).lower() or 'current' in safe_str(s).lower()
@@ -281,16 +227,13 @@ def is_present_str(s: Any) -> bool:
 # ==============================================================================
 
 def download_and_identify_file(file_url: str, output_path: str) -> Tuple[bool, str, str]:
-    """
-    Downloads a file from a URL, saves it, and identifies its type.
-    """
     try:
         parsed_url = urlparse(file_url)
         is_google_doc = "docs.google.com" in parsed_url.netloc and "/document/" in parsed_url.path
         is_google_drive = "drive.google.com" in parsed_url.netloc and ("open" in parsed_url.path or "file" in parsed_url.path or "/d/" in parsed_url.path)
 
         REQUEST_TIMEOUT = 60
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0"}
 
         if is_google_doc:
             doc_id = parsed_url.path.split('/d/')[1].split('/')[0]
@@ -298,7 +241,6 @@ def download_and_identify_file(file_url: str, output_path: str) -> Tuple[bool, s
             export_url_parts[2] = f"/document/d/{doc_id}/export"
             export_url_parts[4] = "format=pdf"
             pdf_url = urlunparse(export_url_parts)
-            logger.info(f"Google Docs URL detected, exporting as PDF from: {pdf_url}")
             
             response = requests.get(pdf_url, headers=headers, stream=True, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
@@ -324,14 +266,11 @@ def download_and_identify_file(file_url: str, output_path: str) -> Tuple[bool, s
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
                 
-                # Verify PDF header
                 with open(output_path, 'rb') as f_check:
                     if not f_check.read(5).startswith(b'%PDF'):
                         raise ValueError("On-the-fly conversion did not result in a valid PDF.")
-                logger.info("Successfully converted/downloaded file as PDF from Google Drive.")
             
             except (requests.exceptions.RequestException, ValueError) as e:
-                logger.warning(f"On-the-fly GDrive conversion failed ({e}). Falling back to direct download...")
                 session = requests.Session()
                 session.headers.update(headers)
                 URL = "https://docs.google.com/uc?export=download"
@@ -350,7 +289,7 @@ def download_and_identify_file(file_url: str, output_path: str) -> Tuple[bool, s
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
         
-        else: # Standard URL download
+        else: 
             response = requests.get(file_url, headers=headers, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             response.raise_for_status()
             with open(output_path, 'wb') as f:
@@ -370,24 +309,12 @@ def download_and_identify_file(file_url: str, output_path: str) -> Tuple[bool, s
             elif header.startswith(b'\xff\xd8\xff'):
                 file_type = 'jpeg'
         
-        logger.info(f"File downloaded successfully to {output_path} and identified as type: {file_type}")
         return True, output_path, file_type
 
-    except requests.exceptions.RequestException as e:
-        error_msg = f"Download failed: {str(e)}"
-        logger.error(f"Failed to download from {file_url}: {error_msg}")
-        return False, error_msg, 'error'
-    except ValueError as e:
-        error_msg = f"Invalid file or URL: {str(e)}"
-        logger.error(f"Error processing {file_url}: {error_msg}")
-        return False, error_msg, 'error'
     except Exception as e:
-        error_msg = f"An unexpected error occurred during download: {str(e)}"
-        logger.error(f"Unexpected error for {file_url}: {error_msg}")
-        return False, error_msg, 'error'
+        return False, str(e), 'error'
 
 def extract_urls_from_pdf_annotations(pdf_path: str) -> List[str]:
-    """Extracts hyperlinks from PDF annotations using PyMuPDF."""
     urls = []
     try:
         doc = fitz.open(pdf_path)
@@ -398,14 +325,10 @@ def extract_urls_from_pdf_annotations(pdf_path: str) -> List[str]:
                     urls.append(link["uri"])
         doc.close()
     except Exception as e:
-        logger.warning(f"Error extracting hyperlinks from {pdf_path}: {e}")
+        pass
     return urls
 
 def extract_text_and_urls_from_pdf(pdf_path: str) -> Tuple[str, List[str]]:
-    """
-    Extracts text from a PDF using a robust fallback strategy (pdfplumber -> fitz -> OCR)
-    and also extracts embedded hyperlinks.
-    """
     text_content = ""
     extracted_urls = []
 
@@ -415,9 +338,8 @@ def extract_text_and_urls_from_pdf(pdf_path: str) -> Tuple[str, List[str]]:
                 page_text = page.extract_text()
                 if page_text:
                     text_content += page_text + "\n"
-        logger.info(f"Extraction with pdfplumber successful for {pdf_path}")
     except Exception as e:
-        logger.warning(f"pdfplumber failed for {pdf_path}: {e}. Trying next method.")
+        pass
 
     if not text_content.strip():
         try:
@@ -425,12 +347,10 @@ def extract_text_and_urls_from_pdf(pdf_path: str) -> Tuple[str, List[str]]:
             for page in doc:
                 text_content += page.get_text() + "\n"
             doc.close()
-            logger.info(f"Extraction with fitz successful for {pdf_path}")
         except Exception as e:
-            logger.warning(f"fitz failed for {pdf_path}: {e}. Trying OCR.")
+            pass
 
     if not text_content.strip() and st.session_state.get('enable_ocr', True):
-        logger.info(f"Falling back to OCR for PDF file {pdf_path}")
         try:
             doc = fitz.open(pdf_path)
             for page_num in range(len(doc)):
@@ -439,30 +359,20 @@ def extract_text_and_urls_from_pdf(pdf_path: str) -> Tuple[str, List[str]]:
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 text_content += pytesseract.image_to_string(img) + "\n"
             doc.close()
-            logger.info(f"OCR extraction completed for PDF {pdf_path}")
         except Exception as e:
-            logger.error(f"OCR extraction failed for PDF {pdf_path}: {e}")
+            pass
 
     extracted_urls = extract_urls_from_pdf_annotations(pdf_path)
-
     return text_content, list(set(extracted_urls))
 
 def extract_text_from_image(image_path: str) -> Tuple[str, List[str]]:
-    """
-    Extracts text from an image file (PNG, JPEG, etc.) using OCR.
-    """
     try:
         if not st.session_state.get('enable_ocr', True):
-            logger.warning("OCR is disabled. Cannot process image file.")
             return "OCR is disabled in settings.", []
-            
-        logger.info(f"Extracting text from image file {image_path} using OCR.")
         img = Image.open(image_path)
         text_content = pytesseract.image_to_string(img)
-        logger.info(f"OCR on image file {image_path} completed.")
         return text_content, []
     except Exception as e:
-        logger.error(f"OCR extraction failed for image {image_path}: {e}")
         return f"Error during image processing: {e}", []
 
 # ==============================================================================
@@ -470,15 +380,8 @@ def extract_text_from_image(image_path: str) -> Tuple[str, List[str]]:
 # ==============================================================================
 
 def analyze_text_with_mistral(prompt: str, api_key: str) -> str:
-    """
-    Calls Mistral La Plateforme chat completions API.
-    Includes JITTER and INCREASED BACKOFF to prevent 429 Rate Limits.
-    """
     if not api_key:
         return json.dumps({"error": "Missing Mistral API key for this request."})
-
-    # Create a masked identifier for the key
-    key_id = f"...{api_key[-4:]}" if len(api_key) > 4 else "ShortKey"
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -503,67 +406,42 @@ def analyze_text_with_mistral(prompt: str, api_key: str) -> str:
     }
 
     attempts = 5
-    # INCREASED BACKOFF: Start with 5 seconds wait, not 2
     initial_backoff = 5.0 
 
     for attempt in range(attempts):
         try:
-            # 1. ADD JITTER: Random sleep to desynchronize threads
             time.sleep(uniform(0.5, 2.5))
-
             resp = requests.post(MISTRAL_ENDPOINT, headers=headers, json=payload, timeout=120)
 
             if resp.status_code == 200:
                 data = resp.json()
-                content = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                )
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 return content.strip()
             
             elif resp.status_code == 429:
-                # 2. RATE LIMIT HANDLING: Wait longer exponentially
                 wait_s = (initial_backoff * (2 ** attempt)) + uniform(1, 3)
-                logger.warning(
-                    f"⚠️ RATE LIMIT (429) on Key {key_id}. "
-                    f"Attempt {attempt + 1}/{attempts}. Pausing for {wait_s:.2f}s..."
-                )
                 time.sleep(wait_s)
                 continue
                 
             elif resp.status_code in (500, 502, 503, 504):
                 wait_s = (initial_backoff * (2 ** attempt)) + uniform(1, 3)
-                logger.warning(
-                    f"Mistral Server Error {resp.status_code} on Key {key_id}. "
-                    f"Attempt {attempt + 1}/{attempts}. Retrying in {wait_s:.2f}s..."
-                )
                 time.sleep(wait_s)
                 continue
             else:
-                logger.error(f"Mistral API Error on Key {key_id}: {resp.status_code} - {resp.text}")
-                error_payload = {"error": f"API Error Status {resp.status_code}: {resp.text}"}
-                return json.dumps(error_payload)
+                return json.dumps({"error": f"API Error Status {resp.status_code}: {resp.text}"})
                 
         except requests.exceptions.RequestException as e:
             wait_s = (initial_backoff * (2 ** attempt)) + uniform(1, 3)
-            logger.warning(
-                f"RequestException on Key {key_id} (attempt {attempt + 1}/{attempts}): {e}. "
-                f"Retrying in {wait_s:.2f}s..."
-            )
             time.sleep(wait_s)
             continue
     
-    logger.error(f"Mistral request failed on Key {key_id} after all retries due to persistent errors.")
-    final_error_payload = {"error": "API Rate Limit Exceeded. Failed after all retries."}
-    return json.dumps(final_error_payload)
+    return json.dumps({"error": "API Rate Limit Exceeded. Failed after all retries."})
 
 # ==============================================================================
 #  HELPER & FORMATTING FUNCTIONS
 # ==============================================================================
 
 def get_github_repo_count(username):
-    """Fetches GitHub public repo count and always returns it as a string."""
     if not username:
         return ""
     try:
@@ -576,148 +454,88 @@ def get_github_repo_count(username):
         return ""
 
 def resolve_github_token() -> Tuple[str, str]:
-    """
-    Resolve GitHub token from supported locations.
-    Returns (token, source).
-    """
     try:
         token = safe_str(st.secrets.get("GITHUB_TOKEN", "")).strip()
-        if token:
-            return token, "secrets:GITHUB_TOKEN"
-    except Exception:
-        pass
+        if token: return token, "secrets:GITHUB_TOKEN"
+    except Exception: pass
 
     try:
         service_account = st.secrets.get("gcp_service_account", {})
         if hasattr(service_account, "get"):
             token = safe_str(service_account.get("GITHUB_TOKEN", "")).strip()
-            if token:
-                return token, "secrets:gcp_service_account.GITHUB_TOKEN"
-    except Exception:
-        pass
+            if token: return token, "secrets:gcp_service_account.GITHUB_TOKEN"
+    except Exception: pass
 
     token = safe_str(os.getenv("GITHUB_TOKEN", "")).strip()
-    if token:
-        return token, "env:GITHUB_TOKEN"
+    if token: return token, "env:GITHUB_TOKEN"
 
     return "", "none"
 
 @st.cache_data(ttl=30)
 def get_github_rate_limit_status() -> Dict[str, Any]:
-    """
-    Fetch current GitHub API core rate-limit usage.
-    Cached briefly to avoid adding extra request load from Streamlit reruns.
-    """
     token, token_source = resolve_github_token()
-
     headers = {"Accept": "application/vnd.github.v3+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if token: headers["Authorization"] = f"Bearer {token}"
 
     try:
         response = requests.get("https://api.github.com/rate_limit", headers=headers, timeout=10)
         if response.status_code != 200:
-            return {
-                "ok": False,
-                "status_code": response.status_code,
-                "error": response.text[:300],
-                "is_authenticated": bool(token),
-                "token_source": token_source,
-            }
+            return {"ok": False, "status_code": response.status_code, "error": response.text[:300], "is_authenticated": bool(token), "token_source": token_source}
 
         data = response.json()
         core = data.get("resources", {}).get("core", {})
-
         limit = int(core.get("limit", 0) or 0)
         remaining = int(core.get("remaining", 0) or 0)
         used = int(core.get("used", max(limit - remaining, 0)) or 0)
         reset_epoch = int(core.get("reset", 0) or 0)
-        reset_at_utc = (
-            datetime.utcfromtimestamp(reset_epoch).strftime("%Y-%m-%d %H:%M:%S UTC")
-            if reset_epoch else ""
-        )
+        reset_at_utc = datetime.utcfromtimestamp(reset_epoch).strftime("%Y-%m-%d %H:%M:%S UTC") if reset_epoch else ""
 
-        return {
-            "ok": True,
-            "limit": limit,
-            "used": used,
-            "remaining": remaining,
-            "reset_at_utc": reset_at_utc,
-            "is_authenticated": bool(token),
-            "token_source": token_source,
-        }
+        return {"ok": True, "limit": limit, "used": used, "remaining": remaining, "reset_at_utc": reset_at_utc, "is_authenticated": bool(token), "token_source": token_source}
     except requests.exceptions.RequestException as e:
-        return {
-            "ok": False,
-            "status_code": None,
-            "error": str(e),
-            "is_authenticated": bool(token),
-            "token_source": token_source,
-        }
+        return {"ok": False, "status_code": None, "error": str(e), "is_authenticated": bool(token), "token_source": token_source}
 
 def extract_github_username(url):
     match = re.search(r'github\.com/([^/]+)', url)
     return match.group(1) if match else None
 
 def format_mobile_number(raw_number: str) -> str:
-    """Cleans and formats a mobile number string to a fixed 10-digit format."""
     raw_number = safe_str(raw_number)
-    if not raw_number.strip():
-        return ""
+    if not raw_number.strip(): return ""
     digits_only = re.sub(r'\D', '', raw_number)
-    if len(digits_only) == 12 and digits_only.startswith('91'):
-        return digits_only[2:]
-    elif len(digits_only) == 11 and digits_only.startswith('0'):
-        return digits_only[1:]
-    elif len(digits_only) == 10:
-        return digits_only
-    else:
-        return ""
+    if len(digits_only) == 12 and digits_only.startswith('91'): return digits_only[2:]
+    elif len(digits_only) == 11 and digits_only.startswith('0'): return digits_only[1:]
+    elif len(digits_only) == 10: return digits_only
+    else: return ""
 
 def sort_links(links_list):
     linkedin_link, github_link = "", ""
     other_links = []
     for link in links_list:
         link = safe_str(link)
-        if 'linkedin.com/in/' in link and not linkedin_link:
-            linkedin_link = link
-        elif 'github.com' in link and not github_link:
-            github_link = link
-        else:
-            other_links.append(link)
+        if 'linkedin.com/in/' in link and not linkedin_link: linkedin_link = link
+        elif 'github.com' in link and not github_link: github_link = link
+        else: other_links.append(link)
     if github_link:
         username = extract_github_username(github_link)
-        if username:
-            github_link = f"https://github.com/{username}"
+        if username: github_link = f"https://github.com/{username}"
     return linkedin_link, github_link, other_links
 
 def get_latest_experience(exp_list: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(exp_list, list) or not exp_list:
-        return None
+    if not isinstance(exp_list, list) or not exp_list: return None
     for exp in exp_list:
-        if not isinstance(exp, dict):
-            continue
-        end_date_str = safe_str(exp.get('endDate', ''))
-        if is_present_str(end_date_str):
-            return exp
+        if not isinstance(exp, dict): continue
+        if is_present_str(safe_str(exp.get('endDate', ''))): return exp
     for exp in exp_list:
-        if isinstance(exp, dict):
-            return exp
+        if isinstance(exp, dict): return exp
     return None
 
 def get_highest_education_institute(edu_data):
-    if not isinstance(edu_data, dict):
-        return ""
-    if edu_data.get('masters_doctorate') and safe_str(edu_data['masters_doctorate'].get('collegeName')):
-        return safe_str(edu_data['masters_doctorate']['collegeName'])
-    if edu_data.get('bachelors') and safe_str(edu_data['bachelors'].get('collegeName')):
-        return safe_str(edu_data['bachelors']['collegeName'])
-    if edu_data.get('diploma') and safe_str(edu_data['diploma'].get('collegeName')):
-        return safe_str(edu_data['diploma']['collegeName'])
-    if edu_data.get('intermediate_puc_12th') and safe_str(edu_data['intermediate_puc_12th'].get('collegeName')):
-        return safe_str(edu_data['intermediate_puc_12th']['collegeName'])
-    if edu_data.get('ssc_10th') and safe_str(edu_data['ssc_10th'].get('collegeName')):
-        return safe_str(edu_data['ssc_10th']['collegeName'])
+    if not isinstance(edu_data, dict): return ""
+    if edu_data.get('masters_doctorate') and safe_str(edu_data['masters_doctorate'].get('collegeName')): return safe_str(edu_data['masters_doctorate']['collegeName'])
+    if edu_data.get('bachelors') and safe_str(edu_data['bachelors'].get('collegeName')): return safe_str(edu_data['bachelors']['collegeName'])
+    if edu_data.get('diploma') and safe_str(edu_data['diploma'].get('collegeName')): return safe_str(edu_data['diploma']['collegeName'])
+    if edu_data.get('intermediate_puc_12th') and safe_str(edu_data['intermediate_puc_12th'].get('collegeName')): return safe_str(edu_data['intermediate_puc_12th']['collegeName'])
+    if edu_data.get('ssc_10th') and safe_str(edu_data['ssc_10th'].get('collegeName')): return safe_str(edu_data['ssc_10th']['collegeName'])
     return ""
 
 def check_tesseract_installation():
@@ -728,39 +546,24 @@ def check_tesseract_installation():
         return False
 
 def classify_and_format_projects_from_ai(projects: List[Any]) -> Dict[str, str]:
-    """
-    Reads the 'classification' key from AI output to sort projects.
-    """
     internal_titles, internal_techs = [], []
     external_titles, external_techs = [], []
-
-    if not isinstance(projects, list):
-        projects = []
+    if not isinstance(projects, list): projects = []
 
     for p in projects:
-        if not isinstance(p, dict):
-            continue
-
+        if not isinstance(p, dict): continue
         title = safe_str(p.get('title', '')).strip()
-        if not title:
-            continue
-
+        if not title: continue
         tech_stack_list = p.get('techStack', [])
-        if isinstance(tech_stack_list, list):
-            tech_stack_str = ", ".join(safe_str(tech) for tech in tech_stack_list)
-        else:
-            tech_stack_str = safe_str(tech_stack_list).strip()
-
+        tech_stack_str = ", ".join(safe_str(tech) for tech in tech_stack_list) if isinstance(tech_stack_list, list) else safe_str(tech_stack_list).strip()
         classification = safe_str(p.get('classification', 'External')).lower()
 
         if classification == 'internal':
             internal_titles.append(title)
-            if tech_stack_str:
-                internal_techs.append(tech_stack_str)
+            if tech_stack_str: internal_techs.append(tech_stack_str)
         else:
             external_titles.append(title)
-            if tech_stack_str:
-                external_techs.append(tech_stack_str)
+            if tech_stack_str: external_techs.append(tech_stack_str)
 
     return {
         "Internal Project Title": "\n".join(internal_titles),
@@ -770,12 +573,8 @@ def classify_and_format_projects_from_ai(projects: List[Any]) -> Dict[str, str]:
     }
 
 def assign_priority_band(probability: Any) -> str:
-    """Assigns a priority band based on an overall probability score."""
-    try:
-        prob_numeric = float(probability)
-    except (ValueError, TypeError):
-        return 'Not Shortlisted'
-
+    try: prob_numeric = float(probability)
+    except (ValueError, TypeError): return 'Not Shortlisted'
     if prob_numeric >= 90: return 'P1'
     elif 75 <= prob_numeric < 90: return 'P2'
     elif 60 <= prob_numeric < 75: return 'P3'
@@ -783,37 +582,27 @@ def assign_priority_band(probability: Any) -> str:
 
 def calculate_skill_probabilities(data):
     scores = {column: 0 for column in SKILL_COLUMNS}
-    if not isinstance(data, dict):
-        return scores
+    if not isinstance(data, dict): return scores
 
     skills_list = data.get('skills', []) if isinstance(data.get('skills', []), list) else []
     skills_text = " ".join(safe_str(x) for x in skills_list).lower()
-
     projects = data.get('projects', [])
-    if isinstance(projects, list):
-        projects_text = " ".join(safe_str(x) for x in projects).lower()
-    else:
-        projects_text = safe_str(projects).lower()
-
+    projects_text = " ".join(safe_str(x) for x in projects).lower() if isinstance(projects, list) else safe_str(projects).lower()
     certifications = data.get('certifications', [])
     certs_text = " ".join(safe_str(x) for x in certifications).lower() if isinstance(certifications, list) else safe_str(certifications).lower()
 
-    experience_text = ""
     exp_list = data.get('experience', [])
     if isinstance(exp_list, list):
         exp_chunks = []
         for exp in exp_list:
             if isinstance(exp, dict):
                 desc = exp.get('description', '')
-                if isinstance(desc, list):
-                    exp_chunks.append(" ".join(safe_str(x) for x in desc))
-                else:
-                    exp_chunks.append(safe_str(desc))
+                if isinstance(desc, list): exp_chunks.append(" ".join(safe_str(x) for x in desc))
+                else: exp_chunks.append(safe_str(desc))
                 exp_chunks.append(safe_str(exp.get('jobTitle', '')))
                 exp_chunks.append(safe_str(exp.get('companyName', '')))
         experience_text = " ".join(exp_chunks).lower()
-    else:
-        experience_text = safe_str(exp_list).lower()
+    else: experience_text = safe_str(exp_list).lower()
 
     education_text = safe_str(data.get('education', {})).lower()
     foundational_text = f"{skills_text} {projects_text} {experience_text} {education_text}"
@@ -821,32 +610,19 @@ def calculate_skill_probabilities(data):
     for skill in SKILLS_TO_ASSESS:
         score = 0
         skill_lower = skill.lower()
-        if skill == '.Net':
-            skill_pattern = r'(?i)(?<![a-zA-Z0-9])\.net(?![a-zA-Z0-9])'
-        else:
-            skill_pattern = r'\b' + re.escape(skill_lower) + r'\b'
-
-        if re.search(skill_pattern, foundational_text):
-            score += 10
-        if re.search(skill_pattern, experience_text):
-            score += 30
-        if re.search(skill_pattern, projects_text):
-            score += 20
-        if re.search(skill_pattern, certs_text):
-            score += 20
+        skill_pattern = r'(?i)(?<![a-zA-Z0-9])\.net(?![a-zA-Z0-9])' if skill == '.Net' else r'\b' + re.escape(skill_lower) + r'\b'
+        if re.search(skill_pattern, foundational_text): score += 10
+        if re.search(skill_pattern, experience_text): score += 30
+        if re.search(skill_pattern, projects_text): score += 20
+        if re.search(skill_pattern, certs_text): score += 20
         scores[f'{skill}_Probability'] = score
     return scores
 
 # ==============================================================================
-#  MAIN WORKER FUNCTIONS
-# ==============================================================================
-
-# ==============================================================================
-#  GITHUB TECHNICAL SCREENING MODULE
+#  GITHUB TECHNICAL SCREENING MODULE (For new separated mode)
 # ==============================================================================
 
 def extract_github_info_via_ai(resume_text: str, clickable_links: List[str], api_key: str) -> Dict[str, Any]:
-    """Uses AI to exhaustively find GitHub profiles from text, links, or portfolios."""
     prompt = f"""
     Analyze the following resume content and links to find the candidate's GitHub profile.
     Candidates might provide a username, a full URL, or a link hidden in a portfolio site.
@@ -870,137 +646,30 @@ def extract_github_info_via_ai(resume_text: str, clickable_links: List[str], api
         logger.error(f"Error parsing GitHub info from AI response: {e}")
         return {"github_found": False, "github_url": None, "github_username": None}
 
-# def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, Any]:
-#     """
-#     ULTIMATE DEEP SCAN: Checks Languages (<1%), Topics, Descriptions, 
-#     and scans dependency files (requirements.txt, package.json) for frameworks.
-#     """
-#     if not username:
-#         return {"found": False, "matches": [], "error": "No username"}
-
-#     # Clean and split required tech (e.g., "Django, FastAPI" -> ['django', 'fastapi'])
-#     tech_list = [t.strip().lower() for t in re.split(r'[,\s/]+', required_tech) if t.strip()]
-#     if not tech_list:
-#         return {"found": False, "matches": [], "error": "No tech stack provided"}
-
-#     headers = {"Accept": "application/vnd.github.v3+json"}
-#     if "GITHUB_TOKEN" in st.secrets:
-#         headers["Authorization"] = f"token {st.secrets['GITHUB_TOKEN']}"
-        
-#     try:
-#         # 1. Fetch all public repos
-#         repo_resp = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated", headers=headers, timeout=15)
-#         if repo_resp.status_code != 200:
-#             return {"found": False, "error": f"GitHub API Error: {repo_resp.status_code}"}
-        
-#         repos = repo_resp.json()
-#         matched_repos = []
-
-#         for repo in repos:
-#             repo_name = repo.get('name', '')
-#             owner = repo.get('owner', {}).get('login')
-#             description = (repo.get('description') or '').lower()
-#             topics = [t.lower() for t in repo.get('topics', [])]
-            
-#             # 2. Languages API (Finds the 1% matches)
-#             lang_resp = requests.get(f"https://api.github.com/repos/{owner}/{repo_name}/languages", headers=headers, timeout=5)
-#             repo_langs = [l.lower() for l in lang_resp.json().keys()] if lang_resp.status_code == 200 else []
-            
-#             # 3. Dependency File Scan (For Django, FastAPI, etc.)
-#             # We look for key files in the root to identify frameworks
-#             frameworks_detected = []
-#             manifest_files = ['requirements.txt', 'package.json', 'pyproject.toml', 'go.mod']
-            
-#             # To save API calls, we only scan files if the base language matches (e.g. Python for Django)
-#             if any(lang in ['python', 'javascript', 'typescript', 'go'] for lang in repo_langs):
-#                 for file_name in manifest_files:
-#                     file_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_name}"
-#                     file_resp = requests.get(file_url, headers=headers, timeout=5)
-#                     if file_resp.status_code == 200:
-#                         # Extract text from the manifest file
-#                         import base64
-#                         try:
-#                             content = base64.b64decode(file_resp.json().get('content', '')).decode('utf-8').lower()
-#                             # Check if any of our required tech is inside the requirements/package file
-#                             for tech in tech_list:
-#                                 if tech in content:
-#                                     frameworks_detected.append(tech)
-#                         except Exception:
-#                             pass
-
-#             # 4. Create the Search Blob
-#             search_blob = f"{repo_name} {description} {' '.join(topics)} {' '.join(repo_langs)} {' '.join(frameworks_detected)}".lower()
-
-#             # 5. Final Matching
-#             matches_for_this_repo = []
-#             for tech in tech_list:
-#                 pattern = r'\b' + re.escape(tech) + r'\b'
-#                 if re.search(pattern, search_blob):
-#                     matches_for_this_repo.append(tech)
-
-#             if matches_for_this_repo:
-#                 # 6. Verify Ownership/Commits
-#                 v_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits?author={username}&per_page=1"
-#                 v_resp = requests.get(v_url, headers=headers, timeout=5)
-#                 is_verified = (v_resp.status_code == 200 and len(v_resp.json()) > 0) or (owner.lower() == username.lower())
-                
-#                 if is_verified:
-#                     matched_repos.append({
-#                         "name": repo_name,
-#                         "url": repo.get('html_url'),
-#                         "tech_detected": ", ".join(set(matches_for_this_repo)).title(),
-#                         "details": "Matched via " + ("Files" if frameworks_detected else "Metadata")
-#                     })
-
-#         return {
-#             "found": True,
-#             "matches": matched_repos,
-#             "match_count": len(matched_repos),
-#             "commits_verified": len(matched_repos) > 0
-#         }
-#     except Exception as e:
-#         return {"found": False, "error": str(e)}
-
 def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, Any]:
-    """
-    Analyzes repositories for individual tech stacks. 
-    Assigns 100 per stack if found, then averages the total.
-    """
     if not username:
         return {"found": False, "error": "No username"}
 
-    # Split tech stacks by common delimiters
     tech_list = [t.strip().lower() for t in re.split(r'[,\s/]+', required_tech) if t.strip()]
     if not tech_list:
         return {"found": False, "error": "No tech stack provided"}
 
-    # Result structure for individual tech tracking
     tech_results = {tech: {"score": 0, "projects": []} for tech in tech_list}
-    # For language queries (e.g., javascript/python), require stronger evidence.
-    # This avoids matching a Python-dominant repo just because it has tiny JS files.
     MIN_LANGUAGE_SHARE = 0.25
     LANGUAGE_TECH_ALIASES = {
-        "javascript": {"javascript"},
-        "typescript": {"typescript"},
-        "python": {"python"},
-        "java": {"java"},
-        "php": {"php"},
-        "go": {"go"},
-        "rust": {"rust"},
-        "c#": {"c#", "csharp"},
-        ".net": {"c#", "csharp"},
+        "javascript": {"javascript"}, "typescript": {"typescript"}, "python": {"python"},
+        "java": {"java"}, "php": {"php"}, "go": {"go"}, "rust": {"rust"},
+        "c#": {"c#", "csharp"}, ".net": {"c#", "csharp"},
     }
 
     def normalize_token(value: Any) -> str:
         return safe_str(value).strip().lower().replace(" ", "")
     
     headers = {"Accept": "application/vnd.github.v3+json"}
-    token, _token_source = resolve_github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    token, _ = resolve_github_token()
+    if token: headers["Authorization"] = f"Bearer {token}"
         
     try:
-        # Fetch repos sorted by recent activity
         repo_resp = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated", headers=headers, timeout=15)
         if repo_resp.status_code != 200:
             return {"found": False, "error": f"GitHub API Error: {repo_resp.status_code}"}
@@ -1008,6 +677,10 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
         repos = repo_resp.json()
 
         for repo in repos:
+            # --- OPTIMIZATION 1: Break loop if all techs have been found ---
+            if all(data["score"] == 100 for data in tech_results.values()):
+                break
+
             repo_name = repo.get('name', '')
             owner = repo.get('owner', {}).get('login')
             description = (repo.get('description') or '').lower()
@@ -1015,24 +688,17 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
             primary_language = safe_str(repo.get('language', 'Unknown')).strip()
             primary_language_norm = normalize_token(primary_language)
              
-            # Languages API for high-precision detection
             lang_resp = requests.get(f"https://api.github.com/repos/{owner}/{repo_name}/languages", headers=headers, timeout=5)
             lang_bytes = {}
             if lang_resp.status_code == 200 and isinstance(lang_resp.json(), dict):
                 lang_payload = lang_resp.json()
-                lang_bytes = {
-                    normalize_token(k): int(v or 0)
-                    for k, v in lang_payload.items()
-                    if safe_str(k).strip()
-                }
+                lang_bytes = {normalize_token(k): int(v or 0) for k, v in lang_payload.items() if safe_str(k).strip()}
             repo_langs = list(lang_bytes.keys())
             total_lang_bytes = sum(lang_bytes.values())
              
-            # Manifest/Dependency Scanning
             frameworks_detected = []
             manifest_files = ['package.json', 'requirements.txt', 'pyproject.toml', 'pom.xml', 'go.mod', 'Cargo.toml', 'Web.config']
             
-            # Only scan files if relevant languages are detected to save API calls
             if any(l in ['javascript', 'typescript', 'python', 'java', 'c#', 'rust', 'go'] for l in repo_langs):
                 for file_name in manifest_files:
                     f_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_name}"
@@ -1042,50 +708,44 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
                         try:
                             content = base64.b64decode(f_resp.json().get('content', '') + "===").decode('utf-8').lower()
                             for tech in tech_list:
+                                # OPTIMIZATION 2: Skip checking dependencies for a tech we already found
+                                if tech_results[tech]["score"] == 100:
+                                    continue
                                 if tech in content: frameworks_detected.append(tech)
                         except: pass
 
-            # Aggregate all metadata for search
             search_blob = f"{repo_name} {description} {' '.join(topics)} {' '.join(repo_langs)} {' '.join(frameworks_detected)}".lower()
 
             for tech in tech_list:
-                # Use regex with word boundaries for precision
-                pattern = r'\b' + re.escape(tech) + r'\b'
-                if tech == '.net': pattern = r'(?i)\.net\b' # Special case for .NET
+                # --- OPTIMIZATION 2: Skip regex & commit checks for a tech we already found ---
+                if tech_results[tech]["score"] == 100:
+                    continue
 
+                pattern = r'(?i)\.net\b' if tech == '.net' else r'\b' + re.escape(tech) + r'\b'
                 is_match = False
                 match_reason = "metadata match"
 
                 if tech in LANGUAGE_TECH_ALIASES:
                     aliases = LANGUAGE_TECH_ALIASES[tech]
                     primary_match = primary_language_norm in aliases
-
                     highest_share = 0.0
                     for alias in aliases:
                         bytes_for_lang = lang_bytes.get(alias, 0)
                         if total_lang_bytes > 0 and bytes_for_lang > 0:
                             share = bytes_for_lang / total_lang_bytes
-                            if share > highest_share:
-                                highest_share = share
+                            if share > highest_share: highest_share = share
 
                     if primary_match or highest_share >= MIN_LANGUAGE_SHARE:
                         is_match = True
-                        if primary_match:
-                            match_reason = f"primary language: {primary_language or 'Unknown'}"
-                        else:
-                            match_reason = f"language share: {highest_share:.0%}"
+                        match_reason = f"primary language: {primary_language or 'Unknown'}" if primary_match else f"language share: {highest_share:.0%}"
                 else:
                     if re.search(pattern, search_blob):
                         is_match = True
-                        if tech in frameworks_detected:
-                            match_reason = "dependency file match"
-                        elif tech in topics:
-                            match_reason = "topic match"
-                        elif re.search(pattern, description):
-                            match_reason = "description match"
+                        if tech in frameworks_detected: match_reason = "dependency file match"
+                        elif tech in topics: match_reason = "topic match"
+                        elif re.search(pattern, description): match_reason = "description match"
 
                 if is_match:
-                    # Gate: Verify Ownership/Commits
                     v_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits?author={username}&per_page=1"
                     v_resp = requests.get(v_url, headers=headers, timeout=5)
                     is_verified = (v_resp.status_code == 200 and len(v_resp.json()) > 0) or (owner.lower() == username.lower())
@@ -1096,7 +756,6 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
                         if proj_entry not in tech_results[tech]["projects"]:
                             tech_results[tech]["projects"].append(proj_entry)
 
-        # Calculate Final Average Score
         all_scores = [data["score"] for data in tech_results.values()]
         avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
 
@@ -1110,12 +769,86 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
     except Exception as e:
         return {"found": False, "error": str(e)}
     
+# ==============================================================================
+#  MAIN WORKER FUNCTIONS
+# ==============================================================================
+
+def process_resume_for_github_analysis(row, resume_index, github_skills, company_name, api_key, **kwargs):
+    """Worker specifically for isolated GitHub Analysis."""
+    user_id = row['user_id']
+    resume_link = row['Resume link']
+
+    result = {
+        'User ID': user_id,
+        'Resume Link': resume_link,
+        'GitHub Screening Outcome': 'Error Processing',
+        'Profile Used': 'None',
+        'Ownership': 'N/A',
+        'GitHub Average Probability': 0,
+        'Company Name': company_name
+    }
+
+    input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills) if t.strip()]
+    for tech in input_techs:
+        result[f"{tech}_Projects"] = "N/A"
+        result[f"{tech}_Score"] = 0
+
+    temp_file_path = None
+    try:
+        logger.info(f"Processing GitHub Analysis #{resume_index + 1} for user {user_id}.")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+            temp_file_path = tmp.name
+
+        download_success, msg_or_path, file_type = download_and_identify_file(resume_link, temp_file_path)
+
+        if not download_success:
+            raise ValueError(f"Download Error: {msg_or_path}")
+
+        if file_type == 'pdf':
+            resume_text, clickable_links = extract_text_and_urls_from_pdf(temp_file_path)
+        elif file_type in ['png', 'jpeg']:
+            resume_text, clickable_links = extract_text_from_image(temp_file_path)
+        else:
+            raise ValueError(f"Unsupported file type.")
+
+        if not resume_text.strip():
+            raise ValueError("Could not extract any text from the file.")
+
+        gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
+        
+        if gh_info.get("github_found") and gh_info.get("github_username"):
+            gh_analysis = analyze_github_repositories(gh_info["github_username"], github_skills)
+            
+            if gh_analysis.get("found"):
+                details = gh_analysis.get("tech_details", {})
+                for tech, data in details.items():
+                    col_prefix = tech.upper()
+                    result[f"{col_prefix}_Projects"] = "\n".join(data["projects"]) if data["projects"] else "N/A"
+                    result[f"{col_prefix}_Score"] = data["score"]
+                
+                result['GitHub Average Probability'] = gh_analysis.get("github_average_probability", 0)
+                result['GitHub Screening Outcome'] = "Analysis Complete"
+                result['Ownership'] = "Yes (Verified)" if gh_analysis.get("commits_verified") else "No"
+            else:
+                result['GitHub Screening Outcome'] = gh_analysis.get("error", "Error")
+
+            result['Profile Used'] = gh_info.get("github_url", gh_info.get("github_username"))
+        else:
+            result['GitHub Screening Outcome'] = "Profile Not Found"
+
+    except Exception as e:
+        logger.error(f"Failed GitHub analysis for {user_id}: {e}")
+        result['GitHub Screening Outcome'] = f"Error: {e}"
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try: os.remove(temp_file_path)
+            except: pass
+
+    return result
 
 def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, **kwargs):
-    """
-    Worker for shortlisting. 
-    Includes STRICT Python-based Keyword Validation to prevent "JavaScript" == "Java" confusion.
-    """
+    """Worker for pure AI Priority-Based Shortlisting (No GitHub)."""
     user_id = row['user_id']
     resume_link = row['Resume link']
 
@@ -1136,7 +869,7 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
 
     temp_file_path = None
     try:
-        logger.info(f"Shortlisting resume #{resume_index + 1} for user {user_id} with Project Extraction.")
+        logger.info(f"Shortlisting resume #{resume_index + 1} for user {user_id}.")
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
             temp_file_path = tmp.name
@@ -1147,7 +880,7 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
             raise ValueError(f"Download Error: {msg_or_path}")
 
         if file_type == 'pdf':
-            resume_text, clickable_links = extract_text_and_urls_from_pdf(temp_file_path)
+            resume_text, _ = extract_text_and_urls_from_pdf(temp_file_path)
         elif file_type in ['png', 'jpeg']:
             resume_text, _ = extract_text_from_image(temp_file_path)
         else:
@@ -1156,26 +889,19 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
         if not resume_text.strip():
             raise ValueError("Could not extract any text from the file.")
 
-        # ==============================================================================
-        #  CRITICAL FIX: PYTHON-BASED "JAVA vs JAVASCRIPT" VALIDATION
-        # ==============================================================================
-        
         text_lower = resume_text.lower()
         reqs_lower = user_requirements.lower()
         system_warning = ""
 
-        # Check for Java specifically using REGEX (Word Boundaries)
         if re.search(r'\bjava\b', reqs_lower):
             has_standalone_java = re.search(r'\bjava\b', text_lower)
             if not has_standalone_java:
                 system_warning += "\n\n[SYSTEM WARNING]: The user explicitly requires 'Java' (the backend language). I have scanned the text and 'Java' appears to be MISSING as a standalone word. The text might contain 'JavaScript', but THAT IS NOT JAVA. Treat 'Java' as MISSING."
 
-        # ==============================================================================
-
         project_instruction_block = ""
         if INTERNAL_PROJECTS_STRING:
             project_instruction_block = f"""
-"projects": Analyze the resume for projects. For each project, extract its title and techStack. CRITICALLY, you must add a "classification" field. Classify a project as "Internal" if its title, description or context matches any project from the OFFICIAL INTERNAL PROJECTS LIST provided below. Otherwise, classify it as "External". Be flexible in your matching (e.g., 'Jobby App' in the list should match 'Jobby-app' or 'Jobby Application' in a resume).
+"projects": Analyze the resume for projects. For each project, extract its title and techStack. CRITICALLY, you must add a "classification" field. Classify a project as "Internal" if its title, description or context matches any project from the OFFICIAL INTERNAL PROJECTS LIST provided below. Otherwise, classify it as "External". Be flexible in your matching.
 OFFICIAL INTERNAL PROJECTS LIST: {INTERNAL_PROJECTS_STRING}
 Example Project Entry: {{ "title": "Jobby App", "techStack": ["React", "JS"], "classification": "Internal" }}
 """
@@ -1270,51 +996,6 @@ Return your answer as a **single, pure JSON object**.
         classified_projects = classify_and_format_projects_from_ai(projects_data)
         result.update(classified_projects)
 
-        # --- ENHANCED GITHUB SCREENING INTEGRATION ---
-        github_skills_input = kwargs.get('github_skills', '')
-        gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
-
-        analysis_criteria = github_skills_input if github_skills_input.strip() else user_requirements
-        
-        # Prepare a list of expected tech for column initialization (prevents empty column errors)
-        input_techs = [t.strip().lower() for t in re.split(r'[,\s/]+', analysis_criteria) if t.strip()]
-        
-        # Initialize default value for the new column
-        result['GitHub Probability'] = 0
-        
-        # Inside process_resume_for_shortlisting, replace the GitHub logic section:
-
-        if gh_info.get("github_found") and gh_info.get("github_username"):
-            gh_analysis = analyze_github_repositories(gh_info["github_username"], analysis_criteria)
-            
-            if gh_analysis.get("found"):
-                details = gh_analysis.get("tech_details", {})
-                # Dynamically create columns for EACH tech stack requested
-                for tech, data in details.items():
-                    col_prefix = tech.upper()
-                    # Populating the dynamic columns
-                    result[f"{col_prefix}_Projects"] = "\n".join(data["projects"]) if data["projects"] else "N/A"
-                    result[f"{col_prefix}_Score"] = data["score"]
-                
-                result['GitHub Average Probability'] = gh_analysis.get("github_average_probability", 0)
-                result['GitHub Screening Outcome'] = "Analysis Complete"
-                result['Commit Ownership Verified'] = "Yes (Verified)" if gh_analysis.get("commits_verified") else "No"
-            else:
-                result['GitHub Average Probability'] = 0
-                result['GitHub Screening Outcome'] = gh_analysis.get("error", "Error")
-
-            result['GitHub Profile Used'] = gh_info.get("github_url")
-        else:
-            # Handle case where GitHub profile was not found at all
-            result['GitHub Screening Outcome'] = "Profile Not Found"
-            result['GitHub Profile Used'] = "None"
-            result['GitHub Average Probability'] = 0
-            result['Commit Ownership Verified'] = "N/A"
-            for tech in input_techs:
-                result[f"{tech.upper()}_Projects"] = "N/A"
-                result[f"{tech.upper()}_Score"] = 0
-        # ----------------------------------------------
-
         internal_titles_str = classified_projects.get('Internal Project Title', '')
         external_titles_str = classified_projects.get('External Project Title', '')
         internal_count = len(internal_titles_str.splitlines()) if internal_titles_str else 0
@@ -1375,7 +1056,6 @@ def process_resume_comprehensively(row, resume_index, analysis_type, company_nam
     result['Company Name'] = company_name
 
     temp_file_path = None
-    mistral_response_text_for_logging = ""
     try:
         logger.info(f"Processing resume #{resume_index + 1} for user {user_id} with analysis type: {analysis_type}")
 
@@ -1392,7 +1072,7 @@ def process_resume_comprehensively(row, resume_index, analysis_type, company_nam
         elif file_type in ['png', 'jpeg']:
             resume_text, clickable_links = extract_text_from_image(temp_file_path)
         else:
-            raise ValueError(f"Unsupported file type: The file is not a valid PDF or image.")
+            raise ValueError(f"Unsupported file type.")
 
         if not resume_text.strip():
             raise ValueError("Could not extract any text from the file.")
@@ -1400,7 +1080,7 @@ def process_resume_comprehensively(row, resume_index, analysis_type, company_nam
         project_instruction_block = ""
         if INTERNAL_PROJECTS_STRING and analysis_type != "Personal Details":
             project_instruction_block = f"""
-"projects": Analyze the resume for projects. For each project, extract its title and techStack. CRITICALLY, you must add a "classification" field. Classify a project as "Internal" if its title, description or context matches any project from the OFFICIAL INTERNAL PROJECTS LIST provided below. Otherwise, classify it as "External". Be flexible in your matching (e.g., 'Jobby App' in the list should match 'Jobby-app' or 'Jobby Application' in a resume).
+"projects": Analyze the resume for projects. For each project, extract its title and techStack. CRITICALLY, you must add a "classification" field. Classify a project as "Internal" if its title, description or context matches any project from the OFFICIAL INTERNAL PROJECTS LIST provided below. Otherwise, classify it as "External". Be flexible in your matching.
 OFFICIAL INTERNAL PROJECTS LIST: {INTERNAL_PROJECTS_STRING}
 Example Project Entry: {{ "title": "Jobby App", "techStack": ["React", "JS"], "classification": "Internal" }}
 """
@@ -1414,7 +1094,7 @@ Example Project Entry: {{ "title": "Jobby App", "techStack": ["React", "JS"], "c
             prompt = f"""
 You are a project classification expert. Analyze the provided resume text and perform this CRITICAL task:
 1. Extract all projects mentioned in the resume.
-2. For each project, determine if it is an "Internal" or "External" project by comparing it against the provided OFFICIAL INTERNAL PROJECTS LIST. Your matching should be smart and flexible (e.g., 'Jobby App' in the list should match 'Jobby-app' in the resume).
+2. For each project, determine if it is an "Internal" or "External" project by comparing it against the provided OFFICIAL INTERNAL PROJECTS LIST. Your matching should be smart and flexible.
 3. Return ONLY a pure JSON object with the results.
 
 OFFICIAL INTERNAL PROJECTS LIST:
@@ -1498,9 +1178,8 @@ Resume Text:
 """
 
         mistral_response_text = analyze_text_with_mistral(prompt, api_key=api_key)
-        mistral_response_text_for_logging = mistral_response_text
         data = relaxed_json_loads(mistral_response_text)
-        if not isinstance(data, dict): raise ValueError(f"AI returned non-dict data. Type: {type(data)}")
+        if not isinstance(data, dict): raise ValueError(f"AI returned non-dict data.")
         if "error" in data: raise ValueError(data["error"])
 
         projects_data = data.get('projects', [])
@@ -1547,18 +1226,15 @@ Resume Text:
 
                 certs_data = data.get('certifications', [])
                 if isinstance(certs_data, list):
-                    cleaned_certs = [safe_str(c) for c in certs_data]
-                    result['Certifications'] = "\n".join(c for c in cleaned_certs if c)
+                    result['Certifications'] = "\n".join(safe_str(c) for c in certs_data if c)
 
                 awards_data = data.get('awards', [])
                 if isinstance(awards_data, list):
-                    cleaned_awards = [safe_str(a) for a in awards_data]
-                    result['Awards'] = "\n".join(a for a in cleaned_awards if a)
+                    result['Awards'] = "\n".join(safe_str(a) for a in awards_data if a)
 
                 achievements_data = data.get('achievements', [])
                 if isinstance(achievements_data, list):
-                    cleaned_achievements = [safe_str(a) for a in achievements_data]
-                    result['Achievements'] = "\n".join(a for a in cleaned_achievements if a)
+                    result['Achievements'] = "\n".join(safe_str(a) for a in achievements_data if a)
 
                 latest_exp = get_latest_experience(data.get('experience', []))
                 if latest_exp:
@@ -1572,9 +1248,7 @@ Resume Text:
 
             if analysis_type == "All Data":
                 result.update({'Years of IT Experience': safe_str(data.get('yearsITExperience', "")), 'Years of Non-IT Experience': safe_str(data.get('yearsNonITExperience', ""))})
-
                 edu = data.get('education', {}) if isinstance(data.get('education'), dict) else {}
-
                 result['Highest Education Institute Name'] = get_highest_education_institute(edu)
                 edu_levels = {
                     'masters_doctorate': ('Masters/Doctorate', 'courseName'), 'bachelors': ('Bachelors', 'courseName'),
@@ -1591,26 +1265,16 @@ Resume Text:
                     result[f'{prefix} Year of Completion'] = safe_str(level_data.get('completionYear', ''))
                     result[f'{prefix} Percentage'] = safe_str(level_data.get('percentage', ''))
 
-    except json.JSONDecodeError as e:
-        error_msg = "Error: AI returned a malformed response that could not be parsed."
-        logger.error(f"Failed processing {user_id} ({resume_link}): JSONDecodeError - {e}")
-        logger.debug(f"--- Full Malformed Response ---\n{mistral_response_text_for_logging}\n-----------------------------")
-        if analysis_type == "Internal Projects Matching":
-            result['Total Projects Count'] = error_msg
-        else:
-            result['Full Name'] = error_msg
     except Exception as e:
         logger.error(f"Failed processing {user_id} ({resume_link}): {e}", exc_info=True)
         error_msg_display = f"Error: {e}"
-        if analysis_type == "Internal Projects Matching":
-            result['Total Projects Count'] = error_msg_display
-        else:
-            result['Full Name'] = error_msg_display
+        if analysis_type == "Internal Projects Matching": result['Total Projects Count'] = error_msg_display
+        else: result['Full Name'] = error_msg_display
 
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             try: os.remove(temp_file_path)
-            except OSError as e: logger.error(f"Error removing temp file {temp_file_path}: {e}")
+            except OSError as e: pass
 
     return result
 
@@ -1639,7 +1303,6 @@ def process_resumes_in_batches_live(df, batch_size, worker_function, display_col
         worksheet = get_or_create_worksheet(gspread_client, GSHEET_NAME, subsheet_name)
 
     num_resumes = len(df)
-    # Check key availability
     if not MISTRAL_API_KEYS:
         st.error("No API Keys found! Cannot proceed.")
         return
@@ -1675,8 +1338,10 @@ def process_resumes_in_batches_live(df, batch_size, worker_function, display_col
             for col in numeric_cols:
                 if col in temp_df.columns:
                     temp_df[col] = pd.to_numeric(temp_df[col], errors='coerce').fillna(0).astype(int)
+            
             if "All Data" in st.session_state.get('last_analysis_mode', ''):
                 temp_df = coerce_probability_columns(temp_df)
+                
             cols_to_show = [col for col in display_columns if col in temp_df.columns]
             results_placeholder.dataframe(temp_df[cols_to_show], height=400)
 
@@ -1733,34 +1398,21 @@ def main():
             st.caption(f"GitHub core limit reset time: {gh_rate['reset_at_utc']}")
     else:
         status_code = gh_rate.get("status_code")
-        st.warning(
-            f"Could not fetch GitHub rate-limit status. "
-            f"Status: {status_code if status_code is not None else 'N/A'}"
-        )
+        st.warning(f"Could not fetch GitHub rate-limit status. Status: {status_code if status_code is not None else 'N/A'}")
 
     with st.sidebar:
         st.header("⚙️ Configuration")
-        
-        # Determine number of keys loaded
         num_keys_loaded = len(MISTRAL_API_KEYS) if MISTRAL_API_KEYS else 1
         
         st.session_state.batch_size = st.slider(
-            "Concurrency",
-            min_value=1, 
-            max_value=20, 
-            value=num_keys_loaded,
-            help=f"Loaded {num_keys_loaded} keys. It is recommended to keep this slider at {num_keys_loaded} to avoid Rate Limits."
+            "Concurrency", min_value=1, max_value=20, value=num_keys_loaded,
+            help=f"Loaded {num_keys_loaded} keys. Recommended to keep this at {num_keys_loaded}."
         )
-        st.session_state.enable_ocr = st.checkbox(
-            "Enable OCR for PDFs & Images",
-            value=True,
-            help="Required to read text from scanned PDFs and image files (PNG, JPG)."
-        )
+        st.session_state.enable_ocr = st.checkbox("Enable OCR for PDFs & Images", value=True)
         if not check_tesseract_installation() and st.session_state.get('enable_ocr'):
             st.error("Tesseract is not installed or not in your PATH. OCR will not function.")
 
     st.subheader("Step 1: Provide Resume Data")
-
     input_method = st.radio("Choose input method:", ["Upload CSV", "Paste Text"], horizontal=True, label_visibility="collapsed", index=1)
     df_input = None
 
@@ -1791,33 +1443,36 @@ def main():
                     "Enter Job Description or Requirements for Shortlisting",
                     placeholder="e.g., 'Seeking a senior Python developer with 5+ years of experience...' or 'Java Certification'",
                     height=150,
-                    help="Paste any text here: a full job description, a list of keywords, or a detailed prompt. The analysis will focus on your query's intent."
+                    help="Paste any text here. Leave blank to run Extraction or GitHub Analysis."
                 )
 
                 company_name = st.text_input(
                     "Enter Company Name (Required)",
                     placeholder="e.g., Acme Corporation",
-                    help="This name is required to identify the analysis batch and will be saved with the results."
-                )
-                # NEW DYNAMIC GITHUB SKILLS INPUT
-                github_skills = st.text_input(
-                    "Enter Required Skills for GitHub Analysis",
-                    placeholder="e.g., Python, TensorFlow, Docker",
-                    help="GitHub repositories will be evaluated specifically against these technologies. If left blank, the main Job Description will be used."
+                    help="This name is required to identify the analysis batch."
                 )
 
                 if user_requirements.strip():
                     st.info("**Mode:** Priority-Based Shortlisting (Focused Analysis)")
                 else:
-                    st.info(f"**Mode:** Comprehensive Extraction")
+                    st.info(f"**Mode:** Comprehensive Extraction / GitHub Analysis")
 
             with col2:
                 st.subheader("Step 3: Comprehensive Data Extraction")
                 analysis_type = st.selectbox(
                     "Choose data to extract (used if shortlisting is empty):",
-                    ("All Data", "Personal Details", "Skills & Projects", "Internal Projects Matching"),
-                    help="This analysis runs only if the 'Job Description' box is left empty."
+                    ("All Data", "Personal Details", "Skills & Projects", "Internal Projects Matching", "GitHub Analysis"),
+                    help="Select 'GitHub Analysis' to run a deep dive into the candidate's GitHub repos."
                 )
+                
+                # New dynamic input for GitHub Analysis
+                github_skills = ""
+                if analysis_type == "GitHub Analysis":
+                    github_skills = st.text_input(
+                        "Enter Required Skills for GitHub Analysis",
+                        placeholder="e.g., Python, TensorFlow, Docker",
+                        help="Enter the specific tech stack you want to evaluate against their GitHub."
+                    )
 
                 st.write("")
                 st.subheader("Step 4: Start Analysis")
@@ -1834,7 +1489,7 @@ def main():
                     button_text = f"🚀 Start Shortlisting for {len(df_input)} Resumes"
                 else:
                     shortlisting_mode = "N/A"
-                    button_text = f"🚀 Start '{analysis_type}' Extraction for {len(df_input)} Resumes"
+                    button_text = f"🚀 Start '{analysis_type}' for {len(df_input)} Resumes"
 
                 start_button = st.button(
                     button_text,
@@ -1849,87 +1504,79 @@ def main():
             live_results_container = st.container()
 
             if start_button:
+                # Validation checks
+                if not user_requirements.strip() and analysis_type == "GitHub Analysis" and not github_skills.strip():
+                    st.warning("Please enter Required Skills for GitHub Analysis.", icon="⚠️")
+                    st.stop()
+
                 st.session_state.analysis_running = True
                 with live_results_container:
                     if user_requirements.strip():
-                        # --- 1. SET MODE ---
+                        # --- 1. SHORTLISTING MODE ---
                         st.session_state.last_analysis_mode = "shortlisting"
                         st.session_state.shortlisting_mode = shortlisting_mode
 
-                        # --- 2. GENERATE DYNAMIC TECH COLUMNS ---
-                        # Use github_skills if provided, otherwise fallback to requirements
-                        analysis_criteria = github_skills.strip() if github_skills.strip() else user_requirements.strip()
-                        input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', analysis_criteria) if t.strip()]
-                        
-                        dynamic_gh_cols = []
-                        for tech in input_techs:
-                            dynamic_gh_cols.append(f"{tech}_Projects")
-                            dynamic_gh_cols.append(f"{tech}_Score")
-
-                        # --- 3. DEFINE COLUMN ORDER STRICTLY AS REQUESTED ---
                         display_columns = [
-                            'User ID', 
-                            'Resume Link', 
-                            'Overall Probability'
+                            'User ID', 'Resume Link', 'Overall Probability'
                         ]
-                        
-                        # Inject Priority Band if the mode is selected
                         if st.session_state.shortlisting_mode == "Priority Wise (P1 / P2 / P3 Bands)":
                             display_columns.append('Priority Band')
-
-                        # High-level Summary and GitHub Metadata
+                        
                         display_columns += [
                             'Overall Remarks',
-                            'GitHub Screening Outcome',
-                            'GitHub Profile Used',
-                            'Commit Ownership Verified'
-                        ]
-                        
-                        # Inject the n-number of dynamic tech stacks (Name_Projects, Name_Score)
-                        display_columns += dynamic_gh_cols
-                        
-                        # GitHub Average and Detailed Resume Analysis Probabilities
-                        display_columns += [
-                            'GitHub Average Probability',
-                            'Projects Probability', 
-                            'Projects Remarks', 
-                            'Skills Probability', 
-                            'Skills Remarks', 
-                            'Experience Probability', 
-                            'Experience Remarks', 
-                            'Other Probability', 
-                            'Other Remarks',
-                            'Total Projects Count', 
-                            'Internal Projects Count', 
-                            'External Projects Count',
-                            'Internal Project Title', 
-                            'Internal Projects Techstacks',
-                            'External Project Title',
-                            'External Projects Techstacks'
+                            'Projects Probability', 'Projects Remarks', 
+                            'Skills Probability', 'Skills Remarks', 
+                            'Experience Probability', 'Experience Remarks', 
+                            'Other Probability', 'Other Remarks',
+                            'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
+                            'Internal Project Title', 'Internal Projects Techstacks',
+                            'External Project Title', 'External Projects Techstacks'
                         ]
 
-                        # --- 4. RUN SHORTLISTING PROCESS ---
                         process_resumes_in_batches_live(
-                            df=df_input, 
-                            batch_size=st.session_state.batch_size, 
+                            df=df_input, batch_size=st.session_state.batch_size, 
                             worker_function=process_resume_for_shortlisting,
                             display_columns=display_columns, 
                             user_requirements=user_requirements.strip(), 
-                            company_name=company_name.strip(),
-                            github_skills=github_skills.strip()
+                            company_name=company_name.strip()
                         )
                     else:
-                        # --- 5. COMPREHENSIVE EXTRACTION MODE (If Requirements Empty) ---
                         st.session_state.last_analysis_mode = analysis_type
 
-                        if analysis_type == "Internal Projects Matching":
+                        if analysis_type == "GitHub Analysis":
+                            # --- 2. NEW GITHUB ANALYSIS MODE ---
+                            input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
+                            dynamic_gh_cols = []
+                            for tech in input_techs:
+                                dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
+                                
+                            display_columns = [
+                                'User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership'
+                            ] + dynamic_gh_cols + ['GitHub Average Probability']
+
+                            process_resumes_in_batches_live(
+                                df=df_input, batch_size=st.session_state.batch_size,
+                                worker_function=process_resume_for_github_analysis,
+                                display_columns=display_columns,
+                                github_skills=github_skills.strip(),
+                                company_name=company_name.strip()
+                            )
+                        elif analysis_type == "Internal Projects Matching":
+                            # --- 3. INTERNAL PROJECTS MODE ---
                             display_columns = [
                                 'User ID', 'Resume Link', 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
                                 'Internal Project Titles', 'Internal Project Techstacks',
                                 'External Project Titles', 'External Project Techstacks'
                             ]
+                            process_resumes_in_batches_live(
+                                df=df_input, batch_size=st.session_state.batch_size,
+                                worker_function=process_resume_comprehensively,
+                                display_columns=display_columns,
+                                analysis_type=analysis_type,
+                                company_name=company_name.strip()
+                            )
                         else:
-                            # Standard All Data / Personal Details / Skills extraction
+                            # --- 4. COMPREHENSIVE EXTRACTION MODES ---
                             all_extraction_columns = [
                                 'User ID', 'Resume Link', 'Full Name', 'Mobile Number', 'Email ID',
                                 'LinkedIn Link', 'GitHub Link', 'GitHub Repo Count', 'Other Links', 'City', 'State',
@@ -1943,75 +1590,71 @@ def main():
                                 'Latest Experience Start Date', 'Latest Experience End Date', 'Currently Working? (Yes/No)',
                                 'Certifications', 'Awards', 'Achievements',
                             ]
-                            display_columns = all_extraction_columns
-
-                        # RUN COMPREHENSIVE PROCESS
-                        process_resumes_in_batches_live(
-                            df=df_input, 
-                            batch_size=st.session_state.batch_size,
-                            worker_function=process_resume_comprehensively,
-                            display_columns=display_columns,
-                            analysis_type=analysis_type,
-                            company_name=company_name.strip()
-                        )
+                            process_resumes_in_batches_live(
+                                df=df_input, batch_size=st.session_state.batch_size,
+                                worker_function=process_resume_comprehensively,
+                                display_columns=all_extraction_columns,
+                                analysis_type=analysis_type,
+                                company_name=company_name.strip()
+                            )
+                            
                 st.session_state.analysis_running = False
+
     if st.session_state.comprehensive_results:
         st.markdown("---")
-        
         final_df = pd.DataFrame(st.session_state.comprehensive_results).fillna("")
         
         if st.session_state.last_analysis_mode == "shortlisting":
             prob_cols = ['Overall Probability', 'Projects Probability', 'Skills Probability', 'Experience Probability', 'Other Probability']
             numeric_cols = ['Total Projects Count', 'Internal Projects Count', 'External Projects Count']
             for col in prob_cols:
-                if col in final_df.columns:
-                    final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0)
+                if col in final_df.columns: final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0)
             for col in numeric_cols:
-                 if col in final_df.columns:
-                    final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0).astype(int)
+                 if col in final_df.columns: final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0).astype(int)
             
             base_display_cols = [
                 'User ID', 'Resume Link', 'Overall Probability', 'Overall Remarks',
-    'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
-    'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
-    'GitHub Profile Used', 
-    'Commit Ownership Verified', # NEW COLUMN
-    'GitHub Probability', 
-    'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-    'Internal Project Title', 'Internal Projects Techstacks',
-    'External Project Title', 'External Projects Techstacks'
+                'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
+                'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
+                'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
+                'Internal Project Title', 'Internal Projects Techstacks',
+                'External Project Title', 'External Projects Techstacks'
             ]
 
             if st.session_state.get('shortlisting_mode') == "Priority Wise (P1 / P2 / P3 Bands)":
                 band_order = ['P1', 'P2', 'P3', 'Not Shortlisted']
                 final_df['Priority Band'] = pd.Categorical(final_df['Priority Band'], categories=band_order, ordered=True)
-                
                 display_cols = base_display_cols.copy()
                 display_cols.insert(3, 'Priority Band')
                 display_cols.extend(['Company Name', 'Analysis Datetime'])
-
                 final_df_ordered = final_df.sort_values(by=['Priority Band', 'Overall Probability'], ascending=[True, False])
             else:
                 display_cols = base_display_cols.copy()
                 display_cols.extend(['Company Name', 'Analysis Datetime'])
-                
                 final_df_ordered = final_df.sort_values(by='Overall Probability', ascending=False)
             
             final_df_ordered = final_df_ordered.reindex(columns=[col for col in display_cols if col in final_df_ordered.columns], fill_value='')
             file_name = f"resume_shortlist_{st.session_state.shortlisting_mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                
+
+        elif st.session_state.last_analysis_mode == "GitHub Analysis":
+            base_gh_cols = ['User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership']
+            # Find the dynamic tech-related columns created during generation
+            dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
+            final_column_order = base_gh_cols + dynamic_cols + ['GitHub Average Probability', 'Company Name', 'Analysis Datetime']
+            final_df_ordered = final_df.reindex(columns=[col for col in final_column_order if col in final_df.columns], fill_value='')
+            file_name = f"github_analysis_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
         elif st.session_state.last_analysis_mode == "Internal Projects Matching":
             numeric_cols = ['Total Projects Count', 'Internal Projects Count', 'External Projects Count']
             for col in numeric_cols:
-                if col in final_df.columns:
-                    final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0).astype(int)
+                if col in final_df.columns: final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0).astype(int)
             final_column_order = [
                 'User ID', 'Resume Link', 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
                 'Internal Project Titles', 'Internal Project Techstacks', 'External Project Titles', 'External Project Techstacks',
                 'Company Name', 'Analysis Datetime'
             ]
             final_df_ordered = final_df.reindex(columns=[col for col in final_column_order if col in final_df.columns], fill_value='')
-            file_name = f"resume_analysis_{st.session_state.last_analysis_mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            file_name = f"resume_analysis_projects_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
         else: # Comprehensive Modes
             final_df = coerce_probability_columns(final_df)
@@ -2039,10 +1682,8 @@ def main():
                     unique_bands = sorted(final_df_ordered['Priority Band'].cat.categories.tolist())
                     default_band = ['P1'] if 'P1' in unique_bands else []
                     selected_bands = st.multiselect('Filter by Priority Band:', options=unique_bands, default=default_band)
-                    if selected_bands:
-                        filtered_df = filtered_df[filtered_df['Priority Band'].isin(selected_bands)]
-                    else:
-                        filtered_df = filtered_df[filtered_df['Priority Band'].isin([])]
+                    if selected_bands: filtered_df = filtered_df[filtered_df['Priority Band'].isin(selected_bands)]
+                    else: filtered_df = filtered_df[filtered_df['Priority Band'].isin([])]
                 
                 searchable_cols = [col for col in ['Skills', 'Overall Remarks', 'Internal Project Title', 'External Project Title'] if col in filtered_df.columns]
                 if searchable_cols:
@@ -2054,60 +1695,48 @@ def main():
             with col2:
                 if 'Overall Probability' in filtered_df.columns:
                     prob_range = st.slider('Filter by Overall Probability:', 0, 100, (0, 100))
-                    if prob_range != (0, 100):
-                        filtered_df = filtered_df[(filtered_df['Overall Probability'] >= prob_range[0]) & (filtered_df['Overall Probability'] <= prob_range[1])]
+                    if prob_range != (0, 100): filtered_df = filtered_df[(filtered_df['Overall Probability'] >= prob_range[0]) & (filtered_df['Overall Probability'] <= prob_range[1])]
                 
-                if 'Skills Probability' in filtered_df.columns:
-                    skills_prob_range = st.slider('Filter by Skills Probability:', 0, 100, (0, 100))
-                    if skills_prob_range != (0, 100):
-                        filtered_df = filtered_df[(filtered_df['Skills Probability'] >= skills_prob_range[0]) & (filtered_df['Skills Probability'] <= skills_prob_range[1])]
+                if 'GitHub Average Probability' in filtered_df.columns:
+                    gh_prob_range = st.slider('Filter by GitHub Probability:', 0, 100, (0, 100))
+                    if gh_prob_range != (0, 100): filtered_df = filtered_df[(filtered_df['GitHub Average Probability'] >= gh_prob_range[0]) & (filtered_df['GitHub Average Probability'] <= gh_prob_range[1])]
 
             with col3:
                 st.write("Project Filters:")
                 if 'Internal Projects Count' in filtered_df.columns:
-                    has_internal = st.checkbox('Show only with Internal Projects')
-                    if has_internal:
-                        filtered_df = filtered_df[filtered_df['Internal Projects Count'] > 0]
+                    if st.checkbox('Show only with Internal Projects'): filtered_df = filtered_df[filtered_df['Internal Projects Count'] > 0]
                 if 'External Projects Count' in filtered_df.columns:
-                    has_external = st.checkbox('Show only with External Projects')
-                    if has_external:
-                        filtered_df = filtered_df[filtered_df['External Projects Count'] > 0]
+                    if st.checkbox('Show only with External Projects'): filtered_df = filtered_df[filtered_df['External Projects Count'] > 0]
                 
                 st.write("") 
 
                 if 'Experience Probability' in filtered_df.columns:
                     exp_prob_range = st.slider('Filter by Experience Probability:', 0, 100, (0, 100))
-                    if exp_prob_range != (0, 100):
-                        filtered_df = filtered_df[(filtered_df['Experience Probability'] >= exp_prob_range[0]) & (filtered_df['Experience Probability'] <= exp_prob_range[1])]
+                    if exp_prob_range != (0, 100): filtered_df = filtered_df[(filtered_df['Experience Probability'] >= exp_prob_range[0]) & (filtered_df['Experience Probability'] <= exp_prob_range[1])]
 
             with col4:
                 if 'Projects Probability' in filtered_df.columns:
                     proj_prob_range = st.slider('Filter by Projects Probability:', 0, 100, (0, 100))
-                    if proj_prob_range != (0, 100):
-                        filtered_df = filtered_df[(filtered_df['Projects Probability'] >= proj_prob_range[0]) & (filtered_df['Projects Probability'] <= proj_prob_range[1])]
+                    if proj_prob_range != (0, 100): filtered_df = filtered_df[(filtered_df['Projects Probability'] >= proj_prob_range[0]) & (filtered_df['Projects Probability'] <= proj_prob_range[1])]
 
                 if 'Other Probability' in filtered_df.columns:
                     other_prob_range = st.slider('Filter by Other Probability:', 0, 100, (0, 100))
-                    if other_prob_range != (0, 100):
-                        filtered_df = filtered_df[(filtered_df['Other Probability'] >= other_prob_range[0]) & (filtered_df['Other Probability'] <= other_prob_range[1])]
+                    if other_prob_range != (0, 100): filtered_df = filtered_df[(filtered_df['Other Probability'] >= other_prob_range[0]) & (filtered_df['Other Probability'] <= other_prob_range[1])]
             
             st.markdown("---")
             p_col1, p_col2, p_col3 = st.columns(3)
             with p_col1:
                 if 'Total Projects Count' in filtered_df.columns:
                     min_total = st.number_input('Minimum Total Projects:', 0, 100, 0, 1)
-                    if min_total > 0:
-                        filtered_df = filtered_df[filtered_df['Total Projects Count'] >= min_total]
+                    if min_total > 0: filtered_df = filtered_df[filtered_df['Total Projects Count'] >= min_total]
             with p_col2:
                  if 'Internal Projects Count' in filtered_df.columns:
                     min_internal = st.number_input('Minimum Internal Projects:', 0, 100, 0, 1)
-                    if min_internal > 0:
-                        filtered_df = filtered_df[filtered_df['Internal Projects Count'] >= min_internal]
+                    if min_internal > 0: filtered_df = filtered_df[filtered_df['Internal Projects Count'] >= min_internal]
             with p_col3:
                 if 'External Projects Count' in filtered_df.columns:
                     min_external = st.number_input('Minimum External Projects:', 0, 100, 0, 1)
-                    if min_external > 0:
-                        filtered_df = filtered_df[filtered_df['External Projects Count'] >= min_external]
+                    if min_external > 0: filtered_df = filtered_df[filtered_df['External Projects Count'] >= min_external]
 
         st.info(f"Displaying **{len(filtered_df)}** of **{len(final_df_ordered)}** candidates.")
         
