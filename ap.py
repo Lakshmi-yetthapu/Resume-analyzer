@@ -575,6 +575,86 @@ def get_github_repo_count(username):
     except requests.exceptions.RequestException:
         return ""
 
+def resolve_github_token() -> Tuple[str, str]:
+    """
+    Resolve GitHub token from supported locations.
+    Returns (token, source).
+    """
+    try:
+        token = safe_str(st.secrets.get("GITHUB_TOKEN", "")).strip()
+        if token:
+            return token, "secrets:GITHUB_TOKEN"
+    except Exception:
+        pass
+
+    try:
+        service_account = st.secrets.get("gcp_service_account", {})
+        if hasattr(service_account, "get"):
+            token = safe_str(service_account.get("GITHUB_TOKEN", "")).strip()
+            if token:
+                return token, "secrets:gcp_service_account.GITHUB_TOKEN"
+    except Exception:
+        pass
+
+    token = safe_str(os.getenv("GITHUB_TOKEN", "")).strip()
+    if token:
+        return token, "env:GITHUB_TOKEN"
+
+    return "", "none"
+
+@st.cache_data(ttl=30)
+def get_github_rate_limit_status() -> Dict[str, Any]:
+    """
+    Fetch current GitHub API core rate-limit usage.
+    Cached briefly to avoid adding extra request load from Streamlit reruns.
+    """
+    token, token_source = resolve_github_token()
+
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        response = requests.get("https://api.github.com/rate_limit", headers=headers, timeout=10)
+        if response.status_code != 200:
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "error": response.text[:300],
+                "is_authenticated": bool(token),
+                "token_source": token_source,
+            }
+
+        data = response.json()
+        core = data.get("resources", {}).get("core", {})
+
+        limit = int(core.get("limit", 0) or 0)
+        remaining = int(core.get("remaining", 0) or 0)
+        used = int(core.get("used", max(limit - remaining, 0)) or 0)
+        reset_epoch = int(core.get("reset", 0) or 0)
+        reset_at_utc = (
+            datetime.utcfromtimestamp(reset_epoch).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if reset_epoch else ""
+        )
+
+        return {
+            "ok": True,
+            "limit": limit,
+            "used": used,
+            "remaining": remaining,
+            "reset_at_utc": reset_at_utc,
+            "is_authenticated": bool(token),
+            "token_source": token_source,
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(e),
+            "is_authenticated": bool(token),
+            "token_source": token_source,
+        }
+
 def extract_github_username(url):
     match = re.search(r'github\.com/([^/]+)', url)
     return match.group(1) if match else None
@@ -896,10 +976,28 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
 
     # Result structure for individual tech tracking
     tech_results = {tech: {"score": 0, "projects": []} for tech in tech_list}
+    # For language queries (e.g., javascript/python), require stronger evidence.
+    # This avoids matching a Python-dominant repo just because it has tiny JS files.
+    MIN_LANGUAGE_SHARE = 0.25
+    LANGUAGE_TECH_ALIASES = {
+        "javascript": {"javascript"},
+        "typescript": {"typescript"},
+        "python": {"python"},
+        "java": {"java"},
+        "php": {"php"},
+        "go": {"go"},
+        "rust": {"rust"},
+        "c#": {"c#", "csharp"},
+        ".net": {"c#", "csharp"},
+    }
+
+    def normalize_token(value: Any) -> str:
+        return safe_str(value).strip().lower().replace(" ", "")
     
     headers = {"Accept": "application/vnd.github.v3+json"}
-    if "GITHUB_TOKEN" in st.secrets:
-        headers["Authorization"] = f"token {st.secrets['GITHUB_TOKEN']}"
+    token, _token_source = resolve_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
         
     try:
         # Fetch repos sorted by recent activity
@@ -914,11 +1012,22 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
             owner = repo.get('owner', {}).get('login')
             description = (repo.get('description') or '').lower()
             topics = [t.lower() for t in repo.get('topics', [])]
-            
+            primary_language = safe_str(repo.get('language', 'Unknown')).strip()
+            primary_language_norm = normalize_token(primary_language)
+             
             # Languages API for high-precision detection
             lang_resp = requests.get(f"https://api.github.com/repos/{owner}/{repo_name}/languages", headers=headers, timeout=5)
-            repo_langs = [l.lower() for l in lang_resp.json().keys()] if lang_resp.status_code == 200 else []
-            
+            lang_bytes = {}
+            if lang_resp.status_code == 200 and isinstance(lang_resp.json(), dict):
+                lang_payload = lang_resp.json()
+                lang_bytes = {
+                    normalize_token(k): int(v or 0)
+                    for k, v in lang_payload.items()
+                    if safe_str(k).strip()
+                }
+            repo_langs = list(lang_bytes.keys())
+            total_lang_bytes = sum(lang_bytes.values())
+             
             # Manifest/Dependency Scanning
             frameworks_detected = []
             manifest_files = ['package.json', 'requirements.txt', 'pyproject.toml', 'pom.xml', 'go.mod', 'Cargo.toml', 'Web.config']
@@ -944,15 +1053,46 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
                 pattern = r'\b' + re.escape(tech) + r'\b'
                 if tech == '.net': pattern = r'(?i)\.net\b' # Special case for .NET
 
-                if re.search(pattern, search_blob):
+                is_match = False
+                match_reason = "metadata match"
+
+                if tech in LANGUAGE_TECH_ALIASES:
+                    aliases = LANGUAGE_TECH_ALIASES[tech]
+                    primary_match = primary_language_norm in aliases
+
+                    highest_share = 0.0
+                    for alias in aliases:
+                        bytes_for_lang = lang_bytes.get(alias, 0)
+                        if total_lang_bytes > 0 and bytes_for_lang > 0:
+                            share = bytes_for_lang / total_lang_bytes
+                            if share > highest_share:
+                                highest_share = share
+
+                    if primary_match or highest_share >= MIN_LANGUAGE_SHARE:
+                        is_match = True
+                        if primary_match:
+                            match_reason = f"primary language: {primary_language or 'Unknown'}"
+                        else:
+                            match_reason = f"language share: {highest_share:.0%}"
+                else:
+                    if re.search(pattern, search_blob):
+                        is_match = True
+                        if tech in frameworks_detected:
+                            match_reason = "dependency file match"
+                        elif tech in topics:
+                            match_reason = "topic match"
+                        elif re.search(pattern, description):
+                            match_reason = "description match"
+
+                if is_match:
                     # Gate: Verify Ownership/Commits
                     v_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits?author={username}&per_page=1"
                     v_resp = requests.get(v_url, headers=headers, timeout=5)
                     is_verified = (v_resp.status_code == 200 and len(v_resp.json()) > 0) or (owner.lower() == username.lower())
-                    
+                     
                     if is_verified:
                         tech_results[tech]["score"] = 100
-                        proj_entry = f"{repo_name} ({repo.get('language', 'Framework')})"
+                        proj_entry = f"{repo_name} ({primary_language or 'Unknown'}) - {match_reason}"
                         if proj_entry not in tech_results[tech]["projects"]:
                             tech_results[tech]["projects"].append(proj_entry)
 
@@ -1579,6 +1719,24 @@ def process_resumes_in_batches_live(df, batch_size, worker_function, display_col
 # ==============================================================================
 def main():
     st.set_page_config(page_title="AI Resume Analyzer", layout="wide", page_icon="📄")
+
+    gh_rate = get_github_rate_limit_status()
+    st.subheader("GitHub API Usage")
+    if gh_rate.get("ok"):
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("Current Limit", gh_rate.get("limit", 0))
+        g2.metric("Used", gh_rate.get("used", 0))
+        g3.metric("Remaining", gh_rate.get("remaining", 0))
+        g4.metric("Auth Mode", "Token" if gh_rate.get("is_authenticated") else "No Token")
+        st.caption(f"Token source: {gh_rate.get('token_source', 'none')}")
+        if gh_rate.get("reset_at_utc"):
+            st.caption(f"GitHub core limit reset time: {gh_rate['reset_at_utc']}")
+    else:
+        status_code = gh_rate.get("status_code")
+        st.warning(
+            f"Could not fetch GitHub rate-limit status. "
+            f"Status: {status_code if status_code is not None else 'N/A'}"
+        )
 
     with st.sidebar:
         st.header("⚙️ Configuration")
