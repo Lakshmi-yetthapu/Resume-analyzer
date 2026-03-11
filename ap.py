@@ -619,7 +619,7 @@ def calculate_skill_probabilities(data):
     return scores
 
 # ==============================================================================
-#  GITHUB TECHNICAL SCREENING MODULE (For new separated mode)
+#  GITHUB TECHNICAL SCREENING MODULE 
 # ==============================================================================
 
 def extract_github_info_via_ai(resume_text: str, clickable_links: List[str], api_key: str) -> Dict[str, Any]:
@@ -677,7 +677,6 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
         repos = repo_resp.json()
 
         for repo in repos:
-            # --- OPTIMIZATION 1: Break loop if all techs have been found ---
             if all(data["score"] == 100 for data in tech_results.values()):
                 break
 
@@ -708,7 +707,6 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
                         try:
                             content = base64.b64decode(f_resp.json().get('content', '') + "===").decode('utf-8').lower()
                             for tech in tech_list:
-                                # OPTIMIZATION 2: Skip checking dependencies for a tech we already found
                                 if tech_results[tech]["score"] == 100:
                                     continue
                                 if tech in content: frameworks_detected.append(tech)
@@ -717,7 +715,6 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
             search_blob = f"{repo_name} {description} {' '.join(topics)} {' '.join(repo_langs)} {' '.join(frameworks_detected)}".lower()
 
             for tech in tech_list:
-                # --- OPTIMIZATION 2: Skip regex & commit checks for a tech we already found ---
                 if tech_results[tech]["score"] == 100:
                     continue
 
@@ -848,9 +845,10 @@ def process_resume_for_github_analysis(row, resume_index, github_skills, company
     return result
 
 def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, **kwargs):
-    """Worker for pure AI Priority-Based Shortlisting (No GitHub)."""
+    """Worker for AI Priority-Based Shortlisting (With Dynamic GitHub Integration)."""
     user_id = row['user_id']
     resume_link = row['Resume link']
+    github_skills = kwargs.get('github_skills', '').strip()
 
     result = {
         'User ID': user_id,
@@ -867,7 +865,22 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
         'Total Projects Count': 0, 'Internal Projects Count': 0, 'External Projects Count': 0,
     }
 
+    # Initialize GitHub Columns if required so they always show up correctly
+    if github_skills:
+        result['GitHub Screening Outcome'] = 'Not Evaluated'
+        result['Profile Used'] = 'None'
+        result['Ownership'] = 'N/A'
+        result['GitHub Average Probability'] = 0
+        result['Combined Git & Project Probability'] = 0
+        result['Combined Git & Project Remarks'] = 'Not Evaluated'
+        
+        input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills) if t.strip()]
+        for tech in input_techs:
+            result[f"{tech}_Projects"] = "N/A"
+            result[f"{tech}_Score"] = 0
+
     temp_file_path = None
+    clickable_links = []
     try:
         logger.info(f"Shortlisting resume #{resume_index + 1} for user {user_id}.")
 
@@ -880,9 +893,9 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
             raise ValueError(f"Download Error: {msg_or_path}")
 
         if file_type == 'pdf':
-            resume_text, _ = extract_text_and_urls_from_pdf(temp_file_path)
+            resume_text, clickable_links = extract_text_and_urls_from_pdf(temp_file_path)
         elif file_type in ['png', 'jpeg']:
-            resume_text, _ = extract_text_from_image(temp_file_path)
+            resume_text, clickable_links = extract_text_from_image(temp_file_path)
         else:
             raise ValueError(f"Unsupported file type.")
 
@@ -1003,6 +1016,54 @@ Return your answer as a **single, pure JSON object**.
         result['Internal Projects Count'] = internal_count
         result['External Projects Count'] = external_count
         result['Total Projects Count'] = internal_count + external_count
+
+        # ==============================================================================
+        # DYNAMIC COMBINED GITHUB ANALYSIS LOGIC
+        # ==============================================================================
+        if github_skills:
+            gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
+            
+            # Safely grab the AI's project probability
+            ai_proj_raw = result.get('Projects Probability', 0)
+            try:
+                ai_proj = int(ai_proj_raw)
+            except (ValueError, TypeError):
+                ai_proj = 0
+
+            if gh_info.get("github_found") and gh_info.get("github_username"):
+                gh_analysis = analyze_github_repositories(gh_info["github_username"], github_skills)
+                
+                if gh_analysis.get("found"):
+                    details = gh_analysis.get("tech_details", {})
+                    for tech, tech_data in details.items():
+                        col_prefix = tech.upper()
+                        result[f"{col_prefix}_Projects"] = "\n".join(tech_data["projects"]) if tech_data["projects"] else "N/A"
+                        result[f"{col_prefix}_Score"] = tech_data["score"]
+                    
+                    gh_avg = gh_analysis.get("github_average_probability", 0)
+                    
+                    # COMBINE PROJECTS & GITHUB
+                    combined_proj = int((ai_proj + gh_avg) / 2)
+                    
+                    result['GitHub Average Probability'] = gh_avg
+                    result['GitHub Screening Outcome'] = "Analysis Complete"
+                    result['Ownership'] = "Yes (Verified)" if gh_analysis.get("commits_verified") else "No"
+                    
+                    result['Combined Git & Project Probability'] = combined_proj
+                    result['Combined Git & Project Remarks'] = f"GitHub Score: {gh_avg}%, Resume Projects Score: {ai_proj}%"
+                    
+                else:
+                    result['GitHub Screening Outcome'] = gh_analysis.get("error", "Error")
+                    combined_proj = int((ai_proj + 0) / 2)
+                    result['Combined Git & Project Probability'] = combined_proj
+                    result['Combined Git & Project Remarks'] = f"GitHub Error (0%). Average with Resume Projects ({ai_proj}%) = {combined_proj}%"
+
+                result['Profile Used'] = gh_info.get("github_url", gh_info.get("github_username"))
+            else:
+                result['GitHub Screening Outcome'] = "Profile Not Found"
+                combined_proj = int((ai_proj + 0) / 2)
+                result['Combined Git & Project Probability'] = combined_proj
+                result['Combined Git & Project Remarks'] = f"GitHub Not Found (0%). Average with Resume Projects ({ai_proj}%) = {combined_proj}%"
 
     except Exception as e:
         logger.error(f"Failed shortlisting {user_id} ({resume_link}): {e}")
@@ -1438,12 +1499,18 @@ def main():
 
             col1, col2 = st.columns(2)
             with col1:
-                st.subheader("Step 2: Priority-Based Shortlisting")
+                st.subheader("Step 2: Analysis Configuration")
                 user_requirements = st.text_area(
-                    "Enter Job Description or Requirements for Shortlisting",
+                    "Enter Job Description or Requirements",
                     placeholder="e.g., 'Seeking a senior Python developer with 5+ years of experience...' or 'Java Certification'",
-                    height=150,
-                    help="Paste any text here. Leave blank to run Extraction or GitHub Analysis."
+                    height=100,
+                    help="Fill this to run AI Priority Shortlisting."
+                )
+                
+                github_skills = st.text_input(
+                    "Enter Required Skills for GitHub Analysis (Optional)",
+                    placeholder="e.g., Python, TensorFlow, Docker",
+                    help="If provided alongside the Job Description, it combines Priority AI check with a deep GitHub scan!"
                 )
 
                 company_name = st.text_input(
@@ -1452,27 +1519,20 @@ def main():
                     help="This name is required to identify the analysis batch."
                 )
 
-                if user_requirements.strip():
-                    st.info("**Mode:** Priority-Based Shortlisting (Focused Analysis)")
+                if user_requirements.strip() and github_skills.strip():
+                    st.info("**Mode:** Priority Shortlisting + GitHub Scan (Combined)")
+                elif user_requirements.strip():
+                    st.info("**Mode:** Priority-Based Shortlisting")
                 else:
-                    st.info(f"**Mode:** Comprehensive Extraction / GitHub Analysis")
+                    st.info(f"**Mode:** Comprehensive Extraction / Isolated GitHub")
 
             with col2:
-                st.subheader("Step 3: Comprehensive Data Extraction")
+                st.subheader("Step 3: Extraction Settings")
                 analysis_type = st.selectbox(
-                    "Choose data to extract (used if shortlisting is empty):",
-                    ("All Data", "Personal Details", "Skills & Projects", "Internal Projects Matching", "GitHub Analysis"),
-                    help="Select 'GitHub Analysis' to run a deep dive into the candidate's GitHub repos."
+                    "Choose data to extract (used if Job Description is empty):",
+                    ("All Data", "Personal Details", "Skills & Projects", "Internal Projects Matching", "Isolated GitHub Analysis"),
+                    help="Select 'Isolated GitHub Analysis' to run ONLY a deep dive into the candidate's GitHub repos without parsing other resume data."
                 )
-                
-                # New dynamic input for GitHub Analysis
-                github_skills = ""
-                if analysis_type == "GitHub Analysis":
-                    github_skills = st.text_input(
-                        "Enter Required Skills for GitHub Analysis",
-                        placeholder="e.g., Python, TensorFlow, Docker",
-                        help="Enter the specific tech stack you want to evaluate against their GitHub."
-                    )
 
                 st.write("")
                 st.subheader("Step 4: Start Analysis")
@@ -1505,14 +1565,14 @@ def main():
 
             if start_button:
                 # Validation checks
-                if not user_requirements.strip() and analysis_type == "GitHub Analysis" and not github_skills.strip():
+                if not user_requirements.strip() and analysis_type == "Isolated GitHub Analysis" and not github_skills.strip():
                     st.warning("Please enter Required Skills for GitHub Analysis.", icon="⚠️")
                     st.stop()
 
                 st.session_state.analysis_running = True
                 with live_results_container:
                     if user_requirements.strip():
-                        # --- 1. SHORTLISTING MODE ---
+                        # --- 1. SHORTLISTING MODE (w/ OR w/o GITHUB) ---
                         st.session_state.last_analysis_mode = "shortlisting"
                         st.session_state.shortlisting_mode = shortlisting_mode
 
@@ -1522,8 +1582,20 @@ def main():
                         if st.session_state.shortlisting_mode == "Priority Wise (P1 / P2 / P3 Bands)":
                             display_columns.append('Priority Band')
                         
+                        display_columns.append('Overall Remarks')
+                        
+                        # Dynamically add GitHub columns if skills were provided
+                        if github_skills.strip():
+                            input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
+                            dynamic_gh_cols = []
+                            for tech in input_techs:
+                                dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
+                                
+                            display_columns += [
+                                'GitHub Screening Outcome', 'Profile Used', 'Ownership'
+                            ] + dynamic_gh_cols + ['GitHub Average Probability']
+                        
                         display_columns += [
-                            'Overall Remarks',
                             'Projects Probability', 'Projects Remarks', 
                             'Skills Probability', 'Skills Remarks', 
                             'Experience Probability', 'Experience Remarks', 
@@ -1532,19 +1604,27 @@ def main():
                             'Internal Project Title', 'Internal Projects Techstacks',
                             'External Project Title', 'External Projects Techstacks'
                         ]
+                        
+                        # Add the combined GitHub + Project columns at the very end
+                        if github_skills.strip():
+                            display_columns += [
+                                'Combined Git & Project Probability', 
+                                'Combined Git & Project Remarks'
+                            ]
 
                         process_resumes_in_batches_live(
                             df=df_input, batch_size=st.session_state.batch_size, 
                             worker_function=process_resume_for_shortlisting,
                             display_columns=display_columns, 
                             user_requirements=user_requirements.strip(), 
-                            company_name=company_name.strip()
+                            company_name=company_name.strip(),
+                            github_skills=github_skills.strip()
                         )
                     else:
                         st.session_state.last_analysis_mode = analysis_type
 
-                        if analysis_type == "GitHub Analysis":
-                            # --- 2. NEW GITHUB ANALYSIS MODE ---
+                        if analysis_type == "Isolated GitHub Analysis":
+                            # --- 2. ISOLATED GITHUB ANALYSIS MODE ---
                             input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
                             dynamic_gh_cols = []
                             for tech in input_techs:
@@ -1605,7 +1685,7 @@ def main():
         final_df = pd.DataFrame(st.session_state.comprehensive_results).fillna("")
         
         if st.session_state.last_analysis_mode == "shortlisting":
-            prob_cols = ['Overall Probability', 'Projects Probability', 'Skills Probability', 'Experience Probability', 'Other Probability']
+            prob_cols = ['Overall Probability', 'Projects Probability', 'Skills Probability', 'Experience Probability', 'Other Probability', 'Combined Git & Project Probability']
             numeric_cols = ['Total Projects Count', 'Internal Projects Count', 'External Projects Count']
             for col in prob_cols:
                 if col in final_df.columns: final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0)
@@ -1613,13 +1693,25 @@ def main():
                  if col in final_df.columns: final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0).astype(int)
             
             base_display_cols = [
-                'User ID', 'Resume Link', 'Overall Probability', 'Overall Remarks',
+                'User ID', 'Resume Link', 'Overall Probability', 'Overall Remarks'
+            ]
+            
+            if 'GitHub Screening Outcome' in final_df.columns:
+                base_display_cols += ['GitHub Screening Outcome', 'Profile Used', 'Ownership']
+                dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
+                base_display_cols += dynamic_cols + ['GitHub Average Probability']
+                
+            base_display_cols += [
                 'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
                 'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
                 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
                 'Internal Project Title', 'Internal Projects Techstacks',
                 'External Project Title', 'External Projects Techstacks'
             ]
+            
+            # Make sure combined columns show at the very end of download / final table
+            if 'Combined Git & Project Probability' in final_df.columns:
+                base_display_cols += ['Combined Git & Project Probability', 'Combined Git & Project Remarks']
 
             if st.session_state.get('shortlisting_mode') == "Priority Wise (P1 / P2 / P3 Bands)":
                 band_order = ['P1', 'P2', 'P3', 'Not Shortlisted']
@@ -1636,9 +1728,8 @@ def main():
             final_df_ordered = final_df_ordered.reindex(columns=[col for col in display_cols if col in final_df_ordered.columns], fill_value='')
             file_name = f"resume_shortlist_{st.session_state.shortlisting_mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-        elif st.session_state.last_analysis_mode == "GitHub Analysis":
+        elif st.session_state.last_analysis_mode == "Isolated GitHub Analysis":
             base_gh_cols = ['User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership']
-            # Find the dynamic tech-related columns created during generation
             dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
             final_column_order = base_gh_cols + dynamic_cols + ['GitHub Average Probability', 'Company Name', 'Analysis Datetime']
             final_df_ordered = final_df.reindex(columns=[col for col in final_column_order if col in final_df.columns], fill_value='')
