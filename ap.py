@@ -879,6 +879,10 @@ def calculate_skill_probabilities(data):
         scores[f'{skill}_Probability'] = score
     return scores
 
+# ==============================================================================
+#  GITHUB TECHNICAL SCREENING MODULE (For new separated mode)
+# ==============================================================================
+
 def extract_github_info_via_ai(resume_text: str, clickable_links: List[str], api_key: str) -> Dict[str, Any]:
     prompt = f"""
     Analyze the following resume content and links to find the candidate's GitHub profile.
@@ -1124,9 +1128,11 @@ def process_resume_for_github_analysis(row, resume_index, github_skills, company
 
     return result
 
-def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, lp_dfs=None, skills_required_list=None, github_skills="", **kwargs):
+def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, **kwargs):
+    """Worker for pure AI Priority-Based Shortlisting (No GitHub)."""
     user_id = row['user_id']
     resume_link = row['Resume link']
+    github_skills = kwargs.get('github_skills', '').strip()
 
     result = {
         'User ID': user_id,
@@ -1161,7 +1167,22 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
             result[f"{tech}_Projects"] = "N/A"
             result[f"{tech}_Score"] = 0
 
+    # Initialize GitHub Columns if required so they always show up correctly
+    if github_skills:
+        result['GitHub Screening Outcome'] = 'Not Evaluated'
+        result['Profile Used'] = 'None'
+        result['Ownership'] = 'N/A'
+        result['GitHub Average Probability'] = 0
+        result['Combined Git & Project Probability'] = 0
+        result['Combined Git & Project Remarks'] = 'Not Evaluated'
+        
+        input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills) if t.strip()]
+        for tech in input_techs:
+            result[f"{tech}_Projects"] = "N/A"
+            result[f"{tech}_Score"] = 0
+
     temp_file_path = None
+    clickable_links = []
     try:
         logger.info(f"Shortlisting resume #{resume_index + 1} for user {user_id}.")
 
@@ -1343,6 +1364,54 @@ Return your answer as a **single, pure JSON object**.
         result['Internal Projects Count'] = internal_count
         result['External Projects Count'] = external_count
         result['Total Projects Count'] = internal_count + external_count
+
+        # ==============================================================================
+        # DYNAMIC COMBINED GITHUB ANALYSIS LOGIC
+        # ==============================================================================
+        if github_skills:
+            gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
+            
+            # Safely grab the AI's project probability
+            ai_proj_raw = result.get('Projects Probability', 0)
+            try:
+                ai_proj = int(ai_proj_raw)
+            except (ValueError, TypeError):
+                ai_proj = 0
+
+            if gh_info.get("github_found") and gh_info.get("github_username"):
+                gh_analysis = analyze_github_repositories(gh_info["github_username"], github_skills)
+                
+                if gh_analysis.get("found"):
+                    details = gh_analysis.get("tech_details", {})
+                    for tech, tech_data in details.items():
+                        col_prefix = tech.upper()
+                        result[f"{col_prefix}_Projects"] = "\n".join(tech_data["projects"]) if tech_data["projects"] else "N/A"
+                        result[f"{col_prefix}_Score"] = tech_data["score"]
+                    
+                    gh_avg = gh_analysis.get("github_average_probability", 0)
+                    
+                    # COMBINE PROJECTS & GITHUB
+                    combined_proj = int((ai_proj + gh_avg) / 2)
+                    
+                    result['GitHub Average Probability'] = gh_avg
+                    result['GitHub Screening Outcome'] = "Analysis Complete"
+                    result['Ownership'] = "Yes (Verified)" if gh_analysis.get("commits_verified") else "No"
+                    
+                    result['Combined Git & Project Probability'] = combined_proj
+                    result['Combined Git & Project Remarks'] = f"GitHub Score: {gh_avg}%, Resume Projects Score: {ai_proj}%"
+                    
+                else:
+                    result['GitHub Screening Outcome'] = gh_analysis.get("error", "Error")
+                    combined_proj = int((ai_proj + 0) / 2)
+                    result['Combined Git & Project Probability'] = combined_proj
+                    result['Combined Git & Project Remarks'] = f"GitHub Error (0%). Average with Resume Projects ({ai_proj}%) = {combined_proj}%"
+
+                result['Profile Used'] = gh_info.get("github_url", gh_info.get("github_username"))
+            else:
+                result['GitHub Screening Outcome'] = "Profile Not Found"
+                combined_proj = int((ai_proj + 0) / 2)
+                result['Combined Git & Project Probability'] = combined_proj
+                result['Combined Git & Project Remarks'] = f"GitHub Not Found (0%). Average with Resume Projects ({ai_proj}%) = {combined_proj}%"
 
     except Exception as e:
         logger.error(f"Failed shortlisting {user_id} ({resume_link}): {e}")
@@ -1784,43 +1853,44 @@ def main():
 
             col1, col2 = st.columns(2)
             with col1:
-                st.subheader("Step 2: Core Analysis")
+                st.subheader("Step 2: Priority-Based Shortlisting")
                 user_requirements = st.text_area(
-                    "Enter Job Description (Triggers Priority Shortlisting)",
-                    placeholder="e.g., 'Seeking a senior Python developer with 5+ years of experience...'",
-                    height=100
-                )
-
-                github_skills = st.text_input(
-                    "Enter Required Skills for GitHub Analysis (Optional)",
-                    placeholder="e.g., Python, TensorFlow, Docker",
-                    help="Enter specific tech stack to evaluate their GitHub repos. Runs alongside Shortlisting if both are filled."
+                    "Enter Job Description or Requirements for Shortlisting",
+                    placeholder="e.g., 'Seeking a senior Python developer with 5+ years of experience...' or 'Java Certification'",
+                    height=150,
+                    help="Paste any text here. Leave blank to run Extraction or GitHub Analysis."
                 )
 
                 company_name = st.text_input(
                     "Enter Company Name (Required)",
-                    placeholder="e.g., Acme Corporation"
+                    placeholder="e.g., Acme Corporation",
+                    help="This name is required to identify the analysis batch."
                 )
 
-                is_shortlisting = bool(user_requirements.strip())
-                is_github_only = not is_shortlisting and bool(github_skills.strip())
-
-                if is_shortlisting and github_skills.strip():
-                    st.info("**Mode:** Shortlisting + GitHub Analysis")
-                elif is_shortlisting:
-                    st.info("**Mode:** Priority-Based Shortlisting")
-                elif is_github_only:
-                    st.info("**Mode:** Pure GitHub Analysis")
+                if user_requirements.strip():
+                    st.info("**Mode:** Priority-Based Shortlisting (Focused Analysis)")
                 else:
-                    st.info("**Mode:** Fallback Data Extraction")
+                    st.info(f"**Mode:** Comprehensive Extraction / GitHub Analysis")
 
             with col2:
-                st.subheader("Step 3: Settings & Fallback")
+                st.subheader("Step 3: Comprehensive Data Extraction")
                 analysis_type = st.selectbox(
-                    "Fallback Extraction Mode (If JD and GitHub skills are empty):",
-                    ("All Data", "Personal Details", "Skills & Projects", "Internal Projects Matching"),
-                    help="Used only if you don't enter a Job Description or GitHub Skills."
+                    "Choose data to extract (used if shortlisting is empty):",
+                    ("All Data", "Personal Details", "Skills & Projects", "Internal Projects Matching", "GitHub Analysis"),
+                    help="Select 'GitHub Analysis' to run a deep dive into the candidate's GitHub repos."
                 )
+                
+                # New dynamic input for GitHub Analysis
+                github_skills = ""
+                if analysis_type == "GitHub Analysis":
+                    github_skills = st.text_input(
+                        "Enter Required Skills for GitHub Analysis",
+                        placeholder="e.g., Python, TensorFlow, Docker",
+                        help="Enter the specific tech stack you want to evaluate against their GitHub."
+                    )
+
+                st.write("")
+                st.subheader("Step 4: Start Analysis")
                 
                 shortlisting_options = ["Probability Wise (Default)", "Priority Wise (P1 / P2 / P3 Bands)"]
                 shortlisting_mode = st.selectbox("Choose Shortlisting Mode", options=shortlisting_options, index=1) if is_shortlisting else "N/A"
@@ -1839,25 +1909,17 @@ def main():
             live_results_container = st.container()
 
             if start_button:
-                # BigQuery / Learning Portal Metric Setup
-                lp_dfs_dict = None
-                parsed_skills_list = []
-
-                if st.session_state.enable_lp_metrics:
-                    raw_skills_text = user_requirements.strip() if user_requirements.strip() else github_skills.strip()
-                    
-                    with st.spinner('Parsing config & fetching Learning Portal metrics from BigQuery...'):
-                        parsed_skills_list, relevant_courses = parse_skills_from_config(raw_skills_text)
-                        user_id_list = df_input['user_id'].dropna().tolist()
-                        lp_dfs_dict = fetch_all_metrics(user_id_list, relevant_courses=relevant_courses)
-                        st.info(f"Using Skills for Metric Calculation: {parsed_skills_list}")
+                # Validation checks
+                if not user_requirements.strip() and analysis_type == "GitHub Analysis" and not github_skills.strip():
+                    st.warning("Please enter Required Skills for GitHub Analysis.", icon="⚠️")
+                    st.stop()
 
                 st.session_state.analysis_running = True
                 LP_COLUMNS = ['Course Summary Score', 'Performance Score', 'User Overall Score', 'Placement Match Score', 'LP Overall Score']
 
                 with live_results_container:
-                    if is_shortlisting:
-                        # --- 1. SHORTLISTING MODE (COMBINED WITH GITHUB OPTIONALLY) ---
+                    if user_requirements.strip():
+                        # --- 1. SHORTLISTING MODE ---
                         st.session_state.last_analysis_mode = "shortlisting"
                         st.session_state.shortlisting_mode = shortlisting_mode
 
@@ -1866,46 +1928,34 @@ def main():
                             display_columns.append('Priority Band')
                         
                         display_columns += [
-                            'Overall Remarks', 'Projects Probability', 'Projects Remarks', 
-                            'Skills Probability', 'Skills Remarks', 'Experience Probability', 'Experience Remarks', 
-                            'Other Probability', 'Other Remarks', 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-                            'Internal Project Title', 'Internal Projects Techstacks', 'External Project Title', 'External Projects Techstacks'
+                            'Overall Remarks',
+                            'Projects Probability', 'Projects Remarks', 
+                            'Skills Probability', 'Skills Remarks', 
+                            'Experience Probability', 'Experience Remarks', 
+                            'Other Probability', 'Other Remarks',
+                            'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
+                            'Internal Project Title', 'Internal Projects Techstacks',
+                            'External Project Title', 'External Projects Techstacks'
                         ]
-
-                        # Add dynamic GitHub columns if GitHub Skills were provided
-                        if github_skills.strip():
-                            input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
-                            dynamic_gh_cols = []
-                            for tech in input_techs:
-                                dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
-                            display_columns.extend(['GitHub Screening Outcome', 'Profile Used', 'Ownership'] + dynamic_gh_cols + ['GitHub Average Probability'])
-
-                        if st.session_state.enable_lp_metrics:
-                            display_columns.extend(LP_COLUMNS)
 
                         process_resumes_in_batches_live(
                             df=df_input, batch_size=st.session_state.batch_size, 
                             worker_function=process_resume_for_shortlisting,
                             display_columns=display_columns, 
                             user_requirements=user_requirements.strip(), 
-                            company_name=company_name.strip(),
-                            lp_dfs=lp_dfs_dict,
-                            skills_required_list=parsed_skills_list,
-                            github_skills=github_skills.strip()
+                            company_name=company_name.strip()
                         )
 
-                    elif is_github_only:
-                        # --- 2. PURE GITHUB ANALYSIS MODE ---
-                        st.session_state.last_analysis_mode = "GitHub Analysis"
-                        input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
-                        dynamic_gh_cols = []
-                        for tech in input_techs:
-                            dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
-                            
-                        display_columns = ['User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership'] + dynamic_gh_cols + ['GitHub Average Probability']
-
-                        if st.session_state.enable_lp_metrics:
-                            display_columns.extend(LP_COLUMNS)
+                        if analysis_type == "GitHub Analysis":
+                            # --- 2. NEW GITHUB ANALYSIS MODE ---
+                            input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
+                            dynamic_gh_cols = []
+                            for tech in input_techs:
+                                dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
+                                
+                            display_columns = [
+                                'User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership'
+                            ] + dynamic_gh_cols + ['GitHub Average Probability']
 
                         process_resumes_in_batches_live(
                             df=df_input, batch_size=st.session_state.batch_size,
@@ -1952,7 +2002,7 @@ def main():
         LP_COLUMNS = ['Course Summary Score', 'Performance Score', 'User Overall Score', 'Placement Match Score', 'LP Overall Score']
 
         if st.session_state.last_analysis_mode == "shortlisting":
-            prob_cols = ['Overall Probability', 'Projects Probability', 'Skills Probability', 'Experience Probability', 'Other Probability']
+            prob_cols = ['Overall Probability', 'Projects Probability', 'Skills Probability', 'Experience Probability', 'Other Probability', 'Combined Git & Project Probability']
             numeric_cols = ['Total Projects Count', 'Internal Projects Count', 'External Projects Count']
             for col in prob_cols:
                 if col in final_df.columns: final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0)
@@ -1960,13 +2010,25 @@ def main():
                  if col in final_df.columns: final_df[col] = pd.to_numeric(final_df[col], errors='coerce').fillna(0).astype(int)
             
             base_display_cols = [
-                'User ID', 'Resume Link', 'Overall Probability', 'Overall Remarks',
+                'User ID', 'Resume Link', 'Overall Probability', 'Overall Remarks'
+            ]
+            
+            if 'GitHub Screening Outcome' in final_df.columns:
+                base_display_cols += ['GitHub Screening Outcome', 'Profile Used', 'Ownership']
+                dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
+                base_display_cols += dynamic_cols + ['GitHub Average Probability']
+                
+            base_display_cols += [
                 'Projects Probability', 'Projects Remarks', 'Skills Probability', 'Skills Remarks',
                 'Experience Probability', 'Experience Remarks', 'Other Probability', 'Other Remarks',
                 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
                 'Internal Project Title', 'Internal Projects Techstacks',
                 'External Project Title', 'External Projects Techstacks'
             ]
+            
+            # Make sure combined columns show at the very end of download / final table
+            if 'Combined Git & Project Probability' in final_df.columns:
+                base_display_cols += ['Combined Git & Project Probability', 'Combined Git & Project Remarks']
 
             if st.session_state.get('shortlisting_mode') == "Priority Wise (P1 / P2 / P3 Bands)":
                 band_order = ['P1', 'P2', 'P3', 'Not Shortlisted']
@@ -1990,7 +2052,7 @@ def main():
             final_df_ordered = final_df_ordered.reindex(columns=[col for col in display_cols if col in final_df_ordered.columns], fill_value='')
             file_name = f"resume_shortlist_{st.session_state.shortlisting_mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-        elif st.session_state.last_analysis_mode == "GitHub Analysis":
+        elif st.session_state.last_analysis_mode == "Isolated GitHub Analysis":
             base_gh_cols = ['User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership']
             dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
             final_column_order = base_gh_cols + dynamic_cols + ['GitHub Average Probability'] + LP_COLUMNS + ['Company Name', 'Analysis Datetime']
