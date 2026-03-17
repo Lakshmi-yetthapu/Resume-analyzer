@@ -1,0 +1,29 @@
+skill_name_query,jd_skills
+introduction_to_databases,"sql, mysql, mern"
+react_js,"react js, mern"
+node_js,"node js, mern"
+javascript_essentials,"javascript, mern"
+java,java
+programming_foundations,"python, mern"
+developer_foundations,"git, git hub"
+practical_python,"python, mern"
+build_your_own_static_website,"html, css, mern"
+build_your_own_responsive_website,"html, css, bootstrap, mern"
+build_your_own_dynamic_web_application,"html, css, javascript, mern"
+instruction_flows,
+responsive_web_design_using_flexbox,"html, css, bootstrap, mern"
+react_hooks,"react js, react hooks, mern"
+python_interview_kit,"python, mern"
+front_end_interview_kit,"html, css, javascript, bootstrap, react js, react hooks, mern"
+spring_boot,spring boot
+automation_testing_with_selenium,"automation testing, automation testing with selenium, testing"
+java_interview_kit,java
+data_analytics_foundations,"sql, python, power bi, tableau"
+data_analytics_using_powerBI,power bi
+data_analytics_using_python,python
+data_analytics_using_tableau,tableau
+data_analytics_practice,"sql, python, power bi, tableau"
+interview_essentials,
+elementary_data_structures_and_algorithms,"dsa, data structures"
+data_structures_and_algorithms,"dsa, data structures"
+advanced_data_structures_and_algorithms,"dsa, data structures"

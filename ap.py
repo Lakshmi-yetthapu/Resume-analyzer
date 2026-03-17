@@ -27,11 +27,15 @@ from random import uniform
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
+# NEW IMPORTS FOR BIGQUERY
+from google.oauth2 import service_account
+from google.cloud import bigquery
+from google.api_core import exceptions as bq_exceptions
+
 # ==============================================================================
 #  CONFIGURATION
 # ==============================================================================
 
-# NEW: DYNAMICALLY READ UP TO 10 API KEYS
 MISTRAL_API_KEYS = []
 
 for i in range(1, 13):
@@ -61,6 +65,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# BigQuery Configuration fallback
+BQ_PROJECT_ID = "kossip-helpers"
+BQ_DATASET_ID = st.secrets.get("BQ_DATASET_ID", "placement_support_analytics")
+
 # ##############################################################################
 #  GOOGLE SHEETS CONFIGURATION
 # ##############################################################################
@@ -76,7 +84,7 @@ def get_gspread_client():
         ]
         if "gcp_service_account" in st.secrets:
             creds = ServiceAccountCredentials.from_json_keyfile_dict(
-                st.secrets["gcp_service_account"], scope
+                dict(st.secrets["gcp_service_account"]), scope
             )
             client = gspread.authorize(creds)
             logger.info("Successfully authorized with Google Sheets API.")
@@ -109,9 +117,280 @@ def get_or_create_worksheet(client, sheet_name, subsheet_name):
         st.warning("⚠️ Could not connect to Google Sheets (Network/DNS Error). Saving to Sheet is disabled.")
         return None
 
-# ##############################################################################
-#  END OF GOOGLE SHEETS CONFIGURATION
-# ##############################################################################
+
+# ==============================================================================
+#  LEARNING PORTAL METRICS & BIGQUERY 
+# ==============================================================================
+
+def clean_uid(uid: Any) -> str:
+    """Cleans IDs by removing trailing .0 from pandas floats and strips hyphens."""
+    s = str(uid).strip().replace('-', '')
+    if s.endswith('.0'):
+        s = s[:-2]
+    return s
+
+@st.cache_resource
+def get_bq_client():
+    """Initializes and returns a BigQuery client using secrets."""
+    try:
+        if "gcp_service_account" in st.secrets:
+            creds_info = dict(st.secrets["gcp_service_account"])
+            credentials = service_account.Credentials.from_service_account_info(creds_info)
+            return bigquery.Client(credentials=credentials, project=creds_info.get("project_id", BQ_PROJECT_ID))
+        else:
+            logger.warning("No GCP credentials in secrets. BigQuery disabled.")
+            return None
+    except Exception as e:
+        logger.error(f"Error initializing BigQuery client: {e}")
+        return None
+
+def safe_float(value):
+    """Convert a value to float, handling None, NA, or invalid strings."""
+    try:
+        if pd.isna(value):  
+            return 0.0
+        return float(value) if value not in [None, "", "NaN", "nan"] else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+def parse_skills_from_config(raw_skills_text: str) -> Tuple[List[str], List[str]]:
+    """Safely parses skills using Exact Word Boundary Regex to map to courses."""
+    raw_skills_text = raw_skills_text.lower()
+    extracted_skills = set()
+    relevant_courses = set()
+    
+    try:
+        if os.path.exists("skills_config.csv"):
+            with open("skills_config.csv", "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines[1:]:  # Skip header
+                line = line.strip()
+                if not line or ',' not in line:
+                    continue
+                
+                parts = line.split(',', 1)
+                course_query = parts[0].strip()
+                jd_skills_str = parts[1].strip()
+                
+                keywords = [k.strip().lower() for k in jd_skills_str.split(',') if k.strip()]
+                for kw in keywords:
+                    pattern = r'(?i)(?<![a-zA-Z0-9])' + re.escape(kw) + r'(?![a-zA-Z0-9])'
+                    if re.search(pattern, raw_skills_text):
+                        extracted_skills.add(kw)
+                        relevant_courses.add(course_query)
+    except Exception as e:
+        logger.warning(f"Could not parse skills_config.csv: {e}")
+        
+    # Fallback if no specific JD skills matched
+    if not extracted_skills:
+        words = [w.strip().lower() for w in re.split(r'[,\s/]+', raw_skills_text) if w.strip()]
+        extracted_skills.update(words)
+        
+    return list(extracted_skills), list(relevant_courses)
+
+def fetch_all_metrics(input_df_users, relevant_courses=None):
+    """Fetch all metrics from BigQuery once for all users in the batch."""
+    empty_res = {"course_df": pd.DataFrame(), "user_df": pd.DataFrame(), "perf_df": pd.DataFrame(), "place_df": pd.DataFrame()}
+    if not input_df_users:
+        return empty_res
+
+    client = get_bq_client()
+    if not client:
+        st.error("❌ BigQuery Client failed to initialize. Check your GCP Service Account secrets.")
+        return empty_res
+
+    clean_users = [clean_uid(u) for u in input_df_users if clean_uid(u)]
+    if not clean_users:
+        return empty_res
+        
+    user_filter = f"WHERE REPLACE(CAST(user_id AS STRING),'-','') IN ({','.join([f"'{u}'" for u in clean_users])})"
+
+    def execute_query(query, name):
+        try:
+            df = client.query(query).result().to_dataframe()
+            df.columns = [c.lower() for c in df.columns]
+            return df
+        except Exception as e:
+            st.error(f"❌ BigQuery Error in {name}: {e}")
+            return pd.DataFrame()
+
+    # Fetch tables
+    course_table = f"{client.project}.{BQ_DATASET_ID}.z_ccbp_users_skill_wise_details_for_psm_team"
+    if relevant_courses:
+        course_query = f"SELECT * FROM `{course_table}` {user_filter} AND skill IN ({','.join([f"'{c}'" for c in relevant_courses])})"
+    else:
+        course_query = f"SELECT * FROM `{course_table}` {user_filter}"
+    course_df = execute_query(course_query, "Course Metrics")
+
+    user_table = f"{client.project}.{BQ_DATASET_ID}.z_ccbp_users_attendance_metrics_for_psm_team"
+    user_df = execute_query(f"SELECT * FROM `{user_table}` {user_filter}", "User Metrics")
+
+    perf_table = f"{client.project}.{BQ_DATASET_ID}.z_ccbp_users_skill_wise_jobs_summary_stats_for_psm_team"
+    perf_df = execute_query(f"SELECT * FROM `{perf_table}` {user_filter}", "Performance Metrics")
+
+    place_table = f"{client.project}.{BQ_DATASET_ID}.z_placed_more_opps_users_details_for_psm_team"
+    place_df = execute_query(f"SELECT * FROM `{place_table}` {user_filter}", "Placement Metrics")
+
+    st.success(f"📊 **BigQuery Fetch Complete**: Found {len(course_df)} Course records, {len(user_df)} User records, {len(perf_df)} Performance records, and {len(place_df)} Placement records.")
+
+    return {"course_df": course_df, "user_df": user_df, "perf_df": perf_df, "place_df": place_df}
+
+def calculate_course_summary_score(course_df, user_id):
+    if course_df is None or course_df.empty:
+        return 0.0, []
+
+    if 'user_id' not in course_df.columns:
+        return 0.0, []
+
+    course_df['user_id'] = course_df['user_id'].apply(clean_uid)
+    user_id = clean_uid(user_id)
+    
+    user_course_df = course_df[course_df['user_id'] == user_id].copy()
+    if user_course_df.empty:
+        return 0.0, []
+
+    total_weight = 1.05
+    weights = {
+        'completion_percentage': 0 / total_weight,
+        'course_exam_best_score_percentage': 0.1 / total_weight,
+        'percent_questions_solved': 0.1 / total_weight,
+        'percent_questions_solved_with_help': 0.1 / total_weight,
+        'max_rating': 0.1 / total_weight,
+        'ic_mock_coding_all_difficulty_rating': 0.1 / total_weight,
+        'nxtmock_sprint_max_rating': 0.1 / total_weight,
+        'nxtmock_non_sprint_max_rating': 0.1 / total_weight,
+        'topin_alpha_coding_all_difficulty_lvl': 0.1 / total_weight,
+        'topin_non_alpha_coding_all_difficulty_lvl': 0.1 / total_weight,
+        'topin_alpha_mcq_all_difficulty_lvl': 0.1 / total_weight,
+        'topin_non_alpha_mcq_all_difficulty_lvl': 0.1 / total_weight
+    }
+
+    if 'max_external_mock_interview_rating' in user_course_df.columns and 'max_ic_mcq_rating' in user_course_df.columns:
+        user_course_df['max_rating'] = user_course_df[['max_external_mock_interview_rating', 'max_ic_mcq_rating']].max(axis=1)
+    else:
+        user_course_df['max_rating'] = 0.0
+    
+    course_scores = []
+    for _, row in user_course_df.iterrows():
+        score = (weights['percent_questions_solved'] * safe_float(row.get('percent_questions_solved', 0)) +
+                 weights['percent_questions_solved_with_help'] * (100 - safe_float(row.get('percent_questions_solved_with_help', 100))) +
+                 weights['max_rating'] * safe_float(row.get('max_rating', 0)) +
+                 weights['ic_mock_coding_all_difficulty_rating'] * safe_float(row.get('ic_mock_coding_all_difficulty_rating', 0)) +
+                 weights['nxtmock_sprint_max_rating'] * safe_float(row.get('nxtmock_sprint_max_rating', 0)) +
+                 weights['nxtmock_non_sprint_max_rating'] * safe_float(row.get('nxtmock_non_sprint_max_rating', 0)) +
+                 weights['topin_alpha_coding_all_difficulty_lvl'] * safe_float(row.get('topin_alpha_coding_all_difficulty_lvl', 0)) +
+                 weights['topin_non_alpha_coding_all_difficulty_lvl'] * safe_float(row.get('topin_non_alpha_coding_all_difficulty_lvl', 0)) +
+                 weights['topin_alpha_mcq_all_difficulty_lvl'] * safe_float(row.get('topin_alpha_mcq_all_difficulty_lvl', 0)) +
+                 weights['topin_non_alpha_mcq_all_difficulty_lvl'] * safe_float(row.get('topin_non_alpha_mcq_all_difficulty_lvl', 0)))
+        if safe_float(row.get('ta_or_not', 0)) == 100:
+            score *= 1.1  
+        course_scores.append(score)
+
+    course_summary_score = sum(course_scores) / len(course_scores) if course_scores and sum(course_scores) > 0 else 0.0
+    courses_completed = user_course_df['skill'].dropna().tolist() if 'skill' in user_course_df.columns else []
+
+    return course_summary_score, courses_completed
+
+def calculate_performance_score(perf_df, user_id, skills_required):
+    if perf_df is None or perf_df.empty: return 0.0
+    if 'user_id' not in perf_df.columns: return 0.0
+
+    perf_df['user_id'] = perf_df['user_id'].apply(clean_uid)
+    user_id = clean_uid(user_id)
+
+    user_perf_df = perf_df[perf_df['user_id'] == user_id].copy()
+    if user_perf_df.empty: return 0.0
+
+    skills_required_lower = [skill.lower() for skill in skills_required]
+    
+    if 'skill' in user_perf_df.columns and skills_required_lower:
+        user_perf_df['skill'] = user_perf_df['skill'].astype(str).str.lower()
+        user_perf_df = user_perf_df[user_perf_df['skill'].isin(skills_required_lower)]
+            
+    if user_perf_df.empty:
+        return 0.0
+
+    perf_scores = []
+    for _, row in user_perf_df.iterrows():
+        last6_score = (0.4 * safe_float(row.get('last6_hired_percentage', 0)) +
+                      0.3 * safe_float(row.get('last6_hr_percentage', 0)) +
+                      0.2 * safe_float(row.get('last6_tech_round_percentage', 0)))
+        overall_score = (0.4 * safe_float(row.get('overall_hired_percentage', 0)) +
+                        0.3 * safe_float(row.get('overall_hr_percentage', 0)) +
+                        0.2 * safe_float(row.get('overall_tech_round_percentage', 0)))
+        perf_score = (0.7 * last6_score + 0.3 * overall_score)
+        perf_scores.append(perf_score)
+
+    return sum(perf_scores) / len(perf_scores) if perf_scores else 0.0
+
+def get_learning_portal_metrics(user_id, skills_required, course_df=None, user_df=None, perf_df=None, place_df=None, prev_exp_match_percentages=None, place_match_percentages=None, weightages=None):
+    user_id_clean = clean_uid(user_id)
+    
+    if course_df is not None and 'user_id' in course_df.columns: course_df['user_id'] = course_df['user_id'].apply(clean_uid)
+    if user_df is not None and 'user_id' in user_df.columns: user_df['user_id'] = user_df['user_id'].apply(clean_uid)
+    if perf_df is not None and 'user_id' in perf_df.columns: perf_df['user_id'] = perf_df['user_id'].apply(clean_uid)
+    if place_df is not None and 'user_id' in place_df.columns: place_df['user_id'] = place_df['user_id'].apply(clean_uid)
+
+    course_summary_score, courses_completed = calculate_course_summary_score(course_df, user_id_clean)
+    
+    # User Overall Score
+    if user_df is not None and not user_df.empty and user_id_clean in user_df['user_id'].values:
+        row = user_df[user_df['user_id'] == user_id_clean].iloc[0]
+        roles_str = str(row.get('previous_experience_job_role', ''))
+        roles = list(set(r.strip() for r in roles_str.split(',') if r.strip()))
+        
+        role_match_scores = []
+        if prev_exp_match_percentages:
+            role_match_scores = [prev_exp_match_percentages.get(role, 0.0) for role in roles]
+        role_match_score = sum(role_match_scores) / len(role_match_scores) if role_match_scores else 0.0
+        
+        days_login = safe_float(row.get('days_since_latest_login', 0))
+        user_overall_score = 0.5 * safe_float(row.get('attendence_percentage', 0)) + 0.2 * max(0, 100 - (days_login / 365 * 100) if days_login <= 365 else 0) + 0.3 * role_match_score
+    else:
+        user_overall_score = 0.0
+
+    # Performance Score
+    performance_score = calculate_performance_score(perf_df, user_id_clean, skills_required)
+    
+    # Placement Match Score
+    if place_df is not None and not place_df.empty and user_id_clean in place_df['user_id'].values:
+        user_place_df = place_df[place_df['user_id'] == user_id_clean]
+        job_roles = user_place_df['job_role'].dropna().unique().tolist() if 'job_role' in user_place_df.columns else []
+        
+        match_scores = []
+        if place_match_percentages:
+            match_scores = [place_match_percentages.get(role, 0.0) for role in job_roles]
+        match_score = sum(match_scores) / len(match_scores) if match_scores else 0.0
+        
+        days_placement = safe_float(user_place_df['days_since_last_placement'].iloc[0]) if 'days_since_last_placement' in user_place_df.columns else 0.0
+        placement_recency = max(0, 100 - (days_placement / 365 * 100)) if days_placement <= 365 else 0
+        placement_match_score = 0.7 * match_score + 0.3 * placement_recency
+    else:
+        placement_match_score = 0.0
+
+    if weightages is None:
+        weightages = {"course": 0.25, "user": 0.15, "performance": 0.3, "placement": 0.3}
+        
+    total_weight = sum(weightages.values())
+    
+    lp_overall_score = (
+        weightages["course"] * course_summary_score +
+        weightages["user"] * user_overall_score +
+        weightages["performance"] * performance_score +
+        weightages["placement"] * placement_match_score
+    ) / total_weight
+
+    return {
+        "course_summary_score": course_summary_score,
+        "user_overall_score": user_overall_score,
+        "performance_score": performance_score,
+        "placement_match_score": placement_match_score,
+        "lp_overall_score": lp_overall_score
+    }
+
+# ==============================================================================
+#  GENERAL SANITIZATION & CORE AI FUNCTIONS
+# ==============================================================================
 
 SKILLS_TO_ASSESS = [
     'JavaScript', 'Python', 'Node', 'React', 'Java', 'Springboot', 'DSA',
@@ -134,9 +413,6 @@ def get_internal_projects_as_string(file_path: str) -> str:
 
 INTERNAL_PROJECTS_STRING = get_internal_projects_as_string(INTERNAL_PROJECT_LIST_FILE)
 
-# ==============================================================================
-#  SESSION STATE INITIALIZATION
-# ==============================================================================
 if 'comprehensive_results' not in st.session_state:
     st.session_state.comprehensive_results = []
 if 'analysis_running' not in st.session_state:
@@ -145,10 +421,6 @@ if 'last_analysis_mode' not in st.session_state:
     st.session_state.last_analysis_mode = ""
 if 'shortlisting_mode' not in st.session_state:
     st.session_state.shortlisting_mode = "Probability Wise (Default)"
-
-# ==============================================================================
-#  UTILS — SANITIZATION & SAFE OPS
-# ==============================================================================
 
 CONTROL_CHARS_RE = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 
@@ -221,10 +493,6 @@ def is_present_str(s: Any) -> bool:
     if s is None:
         return False
     return 'present' in safe_str(s).lower() or 'current' in safe_str(s).lower()
-
-# ==============================================================================
-#  PDF DOWNLOADING & EXTRACTION LOGIC
-# ==============================================================================
 
 def download_and_identify_file(file_url: str, output_path: str) -> Tuple[bool, str, str]:
     try:
@@ -375,9 +643,6 @@ def extract_text_from_image(image_path: str) -> Tuple[str, List[str]]:
     except Exception as e:
         return f"Error during image processing: {e}", []
 
-# ==============================================================================
-#  CORE AI & API FUNCTIONS (Mistral)
-# ==============================================================================
 
 def analyze_text_with_mistral(prompt: str, api_key: str) -> str:
     if not api_key:
@@ -436,10 +701,6 @@ def analyze_text_with_mistral(prompt: str, api_key: str) -> str:
             continue
     
     return json.dumps({"error": "API Rate Limit Exceeded. Failed after all retries."})
-
-# ==============================================================================
-#  HELPER & FORMATTING FUNCTIONS
-# ==============================================================================
 
 def get_github_repo_count(username):
     if not username:
@@ -618,10 +879,6 @@ def calculate_skill_probabilities(data):
         scores[f'{skill}_Probability'] = score
     return scores
 
-# ==============================================================================
-#  GITHUB TECHNICAL SCREENING MODULE (For new separated mode)
-# ==============================================================================
-
 def extract_github_info_via_ai(resume_text: str, clickable_links: List[str], api_key: str) -> Dict[str, Any]:
     prompt = f"""
     Analyze the following resume content and links to find the candidate's GitHub profile.
@@ -677,7 +934,6 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
         repos = repo_resp.json()
 
         for repo in repos:
-            # --- OPTIMIZATION 1: Break loop if all techs have been found ---
             if all(data["score"] == 100 for data in tech_results.values()):
                 break
 
@@ -708,7 +964,6 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
                         try:
                             content = base64.b64decode(f_resp.json().get('content', '') + "===").decode('utf-8').lower()
                             for tech in tech_list:
-                                # OPTIMIZATION 2: Skip checking dependencies for a tech we already found
                                 if tech_results[tech]["score"] == 100:
                                     continue
                                 if tech in content: frameworks_detected.append(tech)
@@ -717,7 +972,6 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
             search_blob = f"{repo_name} {description} {' '.join(topics)} {' '.join(repo_langs)} {' '.join(frameworks_detected)}".lower()
 
             for tech in tech_list:
-                # --- OPTIMIZATION 2: Skip regex & commit checks for a tech we already found ---
                 if tech_results[tech]["score"] == 100:
                     continue
 
@@ -768,13 +1022,12 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
         }
     except Exception as e:
         return {"found": False, "error": str(e)}
-    
+
 # ==============================================================================
 #  MAIN WORKER FUNCTIONS
 # ==============================================================================
 
-def process_resume_for_github_analysis(row, resume_index, github_skills, company_name, api_key, **kwargs):
-    """Worker specifically for isolated GitHub Analysis."""
+def process_resume_for_github_analysis(row, resume_index, github_skills, company_name, api_key, lp_dfs=None, skills_required_list=None, **kwargs):
     user_id = row['user_id']
     resume_link = row['Resume link']
 
@@ -785,7 +1038,13 @@ def process_resume_for_github_analysis(row, resume_index, github_skills, company
         'Profile Used': 'None',
         'Ownership': 'N/A',
         'GitHub Average Probability': 0,
-        'Company Name': company_name
+        'Company Name': company_name,
+        # Defaulting Learning Portal metric columns
+        'Course Summary Score': 0.0, 
+        'Performance Score': 0.0, 
+        'User Overall Score': 0.0, 
+        'Placement Match Score': 0.0, 
+        'LP Overall Score': 0.0
     }
 
     input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills) if t.strip()]
@@ -796,6 +1055,24 @@ def process_resume_for_github_analysis(row, resume_index, github_skills, company
     temp_file_path = None
     try:
         logger.info(f"Processing GitHub Analysis #{resume_index + 1} for user {user_id}.")
+
+        # 1. Evaluate Learning Portal Metrics if DataFrames are provided
+        if lp_dfs:
+            lp_metrics = get_learning_portal_metrics(
+                user_id=user_id,
+                skills_required=skills_required_list or [],
+                course_df=lp_dfs.get("course_df"),
+                user_df=lp_dfs.get("user_df"),
+                perf_df=lp_dfs.get("perf_df"),
+                place_df=lp_dfs.get("place_df")
+            )
+            result.update({
+                'Course Summary Score': lp_metrics.get("course_summary_score", 0.0),
+                'Performance Score': lp_metrics.get("performance_score", 0.0),
+                'User Overall Score': lp_metrics.get("user_overall_score", 0.0),
+                'Placement Match Score': lp_metrics.get("placement_match_score", 0.0),
+                'LP Overall Score': lp_metrics.get("lp_overall_score", 0.0)
+            })
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
             temp_file_path = tmp.name
@@ -847,8 +1124,7 @@ def process_resume_for_github_analysis(row, resume_index, github_skills, company
 
     return result
 
-def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, **kwargs):
-    """Worker for pure AI Priority-Based Shortlisting (No GitHub)."""
+def process_resume_for_shortlisting(row, resume_index, user_requirements, company_name, api_key, lp_dfs=None, skills_required_list=None, github_skills="", **kwargs):
     user_id = row['user_id']
     resume_link = row['Resume link']
 
@@ -865,11 +1141,47 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
         'Internal Project Title': "", 'Internal Projects Techstacks': "",
         'External Project Title': "", 'External Projects Techstacks': "",
         'Total Projects Count': 0, 'Internal Projects Count': 0, 'External Projects Count': 0,
+        # Defaulting Learning Portal metric columns
+        'Course Summary Score': 0.0, 
+        'Performance Score': 0.0, 
+        'User Overall Score': 0.0, 
+        'Placement Match Score': 0.0, 
+        'LP Overall Score': 0.0,
+        # Defaulting GitHub metrics in case they are needed
+        'GitHub Screening Outcome': 'Skipped',
+        'Profile Used': 'None',
+        'Ownership': 'N/A',
+        'GitHub Average Probability': 0
     }
+
+    # Pre-fill dynamic GitHub columns if github skills are provided
+    if github_skills.strip():
+        input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
+        for tech in input_techs:
+            result[f"{tech}_Projects"] = "N/A"
+            result[f"{tech}_Score"] = 0
 
     temp_file_path = None
     try:
         logger.info(f"Shortlisting resume #{resume_index + 1} for user {user_id}.")
+
+        # 1. Evaluate Learning Portal Metrics if DataFrames are provided
+        if lp_dfs:
+            lp_metrics = get_learning_portal_metrics(
+                user_id=user_id,
+                skills_required=skills_required_list or [],
+                course_df=lp_dfs.get("course_df"),
+                user_df=lp_dfs.get("user_df"),
+                perf_df=lp_dfs.get("perf_df"),
+                place_df=lp_dfs.get("place_df")
+            )
+            result.update({
+                'Course Summary Score': lp_metrics.get("course_summary_score", 0.0),
+                'Performance Score': lp_metrics.get("performance_score", 0.0),
+                'User Overall Score': lp_metrics.get("user_overall_score", 0.0),
+                'Placement Match Score': lp_metrics.get("placement_match_score", 0.0),
+                'LP Overall Score': lp_metrics.get("lp_overall_score", 0.0)
+            })
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
             temp_file_path = tmp.name
@@ -879,16 +1191,44 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
         if not download_success:
             raise ValueError(f"Download Error: {msg_or_path}")
 
+        # CRITICAL UPDATE: Extracting clickable links here to be passed to GitHub AI
+        clickable_links = []
         if file_type == 'pdf':
-            resume_text, _ = extract_text_and_urls_from_pdf(temp_file_path)
+            resume_text, clickable_links = extract_text_and_urls_from_pdf(temp_file_path)
         elif file_type in ['png', 'jpeg']:
-            resume_text, _ = extract_text_from_image(temp_file_path)
+            resume_text, clickable_links = extract_text_from_image(temp_file_path)
         else:
             raise ValueError(f"Unsupported file type.")
 
         if not resume_text.strip():
             raise ValueError("Could not extract any text from the file.")
 
+        # --- NEW: COMBINED GITHUB ANALYSIS ---
+        if github_skills.strip():
+            result['GitHub Screening Outcome'] = 'Processing'
+            try:
+                gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
+                if gh_info.get("github_found") and gh_info.get("github_username"):
+                    gh_analysis = analyze_github_repositories(gh_info["github_username"], github_skills)
+                    if gh_analysis.get("found"):
+                        details = gh_analysis.get("tech_details", {})
+                        for tech, data in details.items():
+                            col_prefix = tech.upper()
+                            result[f"{col_prefix}_Projects"] = "\n".join(data["projects"]) if data["projects"] else "N/A"
+                            result[f"{col_prefix}_Score"] = data["score"]
+                        result['GitHub Average Probability'] = gh_analysis.get("github_average_probability", 0)
+                        result['GitHub Screening Outcome'] = "Analysis Complete"
+                        result['Ownership'] = "Yes (Verified)" if gh_analysis.get("commits_verified") else "No"
+                    else:
+                        result['GitHub Screening Outcome'] = gh_analysis.get("error", "Error")
+                    result['Profile Used'] = gh_info.get("github_url", gh_info.get("github_username"))
+                else:
+                    result['GitHub Screening Outcome'] = "Profile Not Found"
+            except Exception as e:
+                logger.error(f"GitHub Error during shortlisting for {user_id}: {e}")
+                result['GitHub Screening Outcome'] = f"Error: {e}"
+
+        # --- AI SHORTLISTING (MISTRAL) ---
         text_lower = resume_text.lower()
         reqs_lower = user_requirements.lower()
         system_warning = ""
@@ -1018,7 +1358,7 @@ Return your answer as a **single, pure JSON object**.
 
     return result
 
-def process_resume_comprehensively(row, resume_index, analysis_type, company_name, api_key):
+def process_resume_comprehensively(row, resume_index, analysis_type, company_name, api_key, **kwargs):
     """Worker for comprehensive data extraction with AI-driven project classification."""
     user_id = row['user_id']
     resume_link = row['Resume link']
@@ -1279,12 +1619,11 @@ Resume Text:
     return result
 
 # ==============================================================================
-#  BATCH PROCESSING & UI
+#  BATCH PROCESSING BLOCK
 # ==============================================================================
 
-def process_resumes_in_batches_live(df, batch_size, worker_function, display_columns, **kwargs):
+def process_resumes_in_batches_live(df, batch_size, worker_function, display_columns, lp_dfs=None, skills_required_list=None, github_skills="", **kwargs):
     st.session_state.comprehensive_results = []
-
     progress_text = st.empty()
     progress_bar = st.progress(0)
     results_placeholder = st.empty()
@@ -1302,21 +1641,22 @@ def process_resumes_in_batches_live(df, batch_size, worker_function, display_col
             subsheet_name = analysis_mode.replace(" ", "_")
         worksheet = get_or_create_worksheet(gspread_client, GSHEET_NAME, subsheet_name)
 
-    num_resumes = len(df)
     if not MISTRAL_API_KEYS:
         st.error("No API Keys found! Cannot proceed.")
         return
 
     num_keys = len(MISTRAL_API_KEYS)
-    logger.info(f"Using {num_keys} API keys for {num_resumes} resumes.")
+    logger.info(f"Using {num_keys} API keys for {len(df)} resumes.")
 
     with ThreadPoolExecutor(max_workers=batch_size) as executor:
         futures = {}
         for i, (df_index, row) in enumerate(df.iterrows()):
             key_index = i % num_keys
             assigned_key = MISTRAL_API_KEYS[key_index]
-            
-            future = executor.submit(worker_function, row, df_index, **kwargs, api_key=assigned_key)
+            future = executor.submit(
+                worker_function, row, df_index, **kwargs, 
+                api_key=assigned_key, lp_dfs=lp_dfs, skills_required_list=skills_required_list, github_skills=github_skills
+            )
             futures[future] = df_index
 
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
@@ -1380,8 +1720,9 @@ def process_resumes_in_batches_live(df, batch_size, worker_function, display_col
     progress_text.success(f"**✅ Analysis Complete! {len(df)}/{len(df)} resumes processed. Results saved to Google Sheets.**")
 
 # ==============================================================================
-#  MAIN STREAMLIT APPLICATION
+#  MAIN UI
 # ==============================================================================
+
 def main():
     st.set_page_config(page_title="AI Resume Analyzer", layout="wide", page_icon="📄")
 
@@ -1403,7 +1744,6 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuration")
         num_keys_loaded = len(MISTRAL_API_KEYS) if MISTRAL_API_KEYS else 1
-        
         st.session_state.batch_size = st.slider(
             "Concurrency", min_value=1, max_value=20, value=num_keys_loaded,
             help=f"Loaded {num_keys_loaded} keys. Recommended to keep this at {num_keys_loaded}."
@@ -1411,6 +1751,8 @@ def main():
         st.session_state.enable_ocr = st.checkbox("Enable OCR for PDFs & Images", value=True)
         if not check_tesseract_installation() and st.session_state.get('enable_ocr'):
             st.error("Tesseract is not installed or not in your PATH. OCR will not function.")
+            
+        st.session_state.enable_lp_metrics = st.checkbox("Fetch Learning Portal Metrics (BigQuery)", value=True, help="Automatically fetch User Performance & Score Metrics from BigQuery via GCP Service Account.")
 
     st.subheader("Step 1: Provide Resume Data")
     input_method = st.radio("Choose input method:", ["Upload CSV", "Paste Text"], horizontal=True, label_visibility="collapsed", index=1)
@@ -1430,6 +1772,10 @@ def main():
     if df_input is not None:
         df_input.dropna(subset=['user_id', 'Resume link'], inplace=True)
         df_input = df_input[df_input['Resume link'].str.strip() != ''].reset_index(drop=True)
+        # Ensure user_id is converted completely to string for pandas processing
+        if 'user_id' in df_input.columns:
+            df_input['user_id'] = df_input['user_id'].astype(str).apply(clean_uid)
+
         if not all(col in df_input.columns for col in ['user_id', 'Resume link']):
             st.error("Input data must contain 'user_id' and 'Resume link' columns.")
         else:
@@ -1438,172 +1784,173 @@ def main():
 
             col1, col2 = st.columns(2)
             with col1:
-                st.subheader("Step 2: Priority-Based Shortlisting")
+                st.subheader("Step 2: Core Analysis")
                 user_requirements = st.text_area(
-                    "Enter Job Description or Requirements for Shortlisting",
-                    placeholder="e.g., 'Seeking a senior Python developer with 5+ years of experience...' or 'Java Certification'",
-                    height=150,
-                    help="Paste any text here. Leave blank to run Extraction or GitHub Analysis."
+                    "Enter Job Description (Triggers Priority Shortlisting)",
+                    placeholder="e.g., 'Seeking a senior Python developer with 5+ years of experience...'",
+                    height=100
+                )
+
+                github_skills = st.text_input(
+                    "Enter Required Skills for GitHub Analysis (Optional)",
+                    placeholder="e.g., Python, TensorFlow, Docker",
+                    help="Enter specific tech stack to evaluate their GitHub repos. Runs alongside Shortlisting if both are filled."
                 )
 
                 company_name = st.text_input(
                     "Enter Company Name (Required)",
-                    placeholder="e.g., Acme Corporation",
-                    help="This name is required to identify the analysis batch."
+                    placeholder="e.g., Acme Corporation"
                 )
 
-                if user_requirements.strip():
-                    st.info("**Mode:** Priority-Based Shortlisting (Focused Analysis)")
+                is_shortlisting = bool(user_requirements.strip())
+                is_github_only = not is_shortlisting and bool(github_skills.strip())
+
+                if is_shortlisting and github_skills.strip():
+                    st.info("**Mode:** Shortlisting + GitHub Analysis")
+                elif is_shortlisting:
+                    st.info("**Mode:** Priority-Based Shortlisting")
+                elif is_github_only:
+                    st.info("**Mode:** Pure GitHub Analysis")
                 else:
-                    st.info(f"**Mode:** Comprehensive Extraction / GitHub Analysis")
+                    st.info("**Mode:** Fallback Data Extraction")
 
             with col2:
-                st.subheader("Step 3: Comprehensive Data Extraction")
+                st.subheader("Step 3: Settings & Fallback")
                 analysis_type = st.selectbox(
-                    "Choose data to extract (used if shortlisting is empty):",
-                    ("All Data", "Personal Details", "Skills & Projects", "Internal Projects Matching", "GitHub Analysis"),
-                    help="Select 'GitHub Analysis' to run a deep dive into the candidate's GitHub repos."
+                    "Fallback Extraction Mode (If JD and GitHub skills are empty):",
+                    ("All Data", "Personal Details", "Skills & Projects", "Internal Projects Matching"),
+                    help="Used only if you don't enter a Job Description or GitHub Skills."
                 )
                 
-                # New dynamic input for GitHub Analysis
-                github_skills = ""
-                if analysis_type == "GitHub Analysis":
-                    github_skills = st.text_input(
-                        "Enter Required Skills for GitHub Analysis",
-                        placeholder="e.g., Python, TensorFlow, Docker",
-                        help="Enter the specific tech stack you want to evaluate against their GitHub."
-                    )
-
-                st.write("")
-                st.subheader("Step 4: Start Analysis")
-                
                 shortlisting_options = ["Probability Wise (Default)", "Priority Wise (P1 / P2 / P3 Bands)"]
-                shortlisting_default_index = 1
+                shortlisting_mode = st.selectbox("Choose Shortlisting Mode", options=shortlisting_options, index=1) if is_shortlisting else "N/A"
                 
-                if user_requirements.strip():
-                    shortlisting_mode = st.selectbox(
-                        "Choose Shortlisting Mode",
-                        options=shortlisting_options,
-                        index=shortlisting_default_index 
-                    )
-                    button_text = f"🚀 Start Shortlisting for {len(df_input)} Resumes"
-                else:
-                    shortlisting_mode = "N/A"
-                    button_text = f"🚀 Start '{analysis_type}' for {len(df_input)} Resumes"
-
+                st.write("")
+                button_text = f"🚀 Start Analysis for {len(df_input)} Resumes"
                 start_button = st.button(
                     button_text,
                     type="primary",
-                    disabled=not company_name.strip(),
-                    help="Please enter a Company Name to start the analysis." if not company_name.strip() else ""
+                    disabled=not company_name.strip()
                 )
 
-                if not company_name.strip() and df_input is not None and not start_button:
+                if not company_name.strip() and not start_button:
                      st.warning("Company Name is a required field.", icon="⚠️")
 
             live_results_container = st.container()
 
             if start_button:
-                # Validation checks
-                if not user_requirements.strip() and analysis_type == "GitHub Analysis" and not github_skills.strip():
-                    st.warning("Please enter Required Skills for GitHub Analysis.", icon="⚠️")
-                    st.stop()
+                # BigQuery / Learning Portal Metric Setup
+                lp_dfs_dict = None
+                parsed_skills_list = []
+
+                if st.session_state.enable_lp_metrics:
+                    raw_skills_text = user_requirements.strip() if user_requirements.strip() else github_skills.strip()
+                    
+                    with st.spinner('Parsing config & fetching Learning Portal metrics from BigQuery...'):
+                        parsed_skills_list, relevant_courses = parse_skills_from_config(raw_skills_text)
+                        user_id_list = df_input['user_id'].dropna().tolist()
+                        lp_dfs_dict = fetch_all_metrics(user_id_list, relevant_courses=relevant_courses)
+                        st.info(f"Using Skills for Metric Calculation: {parsed_skills_list}")
 
                 st.session_state.analysis_running = True
+                LP_COLUMNS = ['Course Summary Score', 'Performance Score', 'User Overall Score', 'Placement Match Score', 'LP Overall Score']
+
                 with live_results_container:
-                    if user_requirements.strip():
-                        # --- 1. SHORTLISTING MODE ---
+                    if is_shortlisting:
+                        # --- 1. SHORTLISTING MODE (COMBINED WITH GITHUB OPTIONALLY) ---
                         st.session_state.last_analysis_mode = "shortlisting"
                         st.session_state.shortlisting_mode = shortlisting_mode
 
-                        display_columns = [
-                            'User ID', 'Resume Link', 'Overall Probability'
-                        ]
+                        display_columns = ['User ID', 'Resume Link', 'Overall Probability']
                         if st.session_state.shortlisting_mode == "Priority Wise (P1 / P2 / P3 Bands)":
                             display_columns.append('Priority Band')
                         
                         display_columns += [
-                            'Overall Remarks',
-                            'Projects Probability', 'Projects Remarks', 
-                            'Skills Probability', 'Skills Remarks', 
-                            'Experience Probability', 'Experience Remarks', 
-                            'Other Probability', 'Other Remarks',
-                            'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-                            'Internal Project Title', 'Internal Projects Techstacks',
-                            'External Project Title', 'External Projects Techstacks'
+                            'Overall Remarks', 'Projects Probability', 'Projects Remarks', 
+                            'Skills Probability', 'Skills Remarks', 'Experience Probability', 'Experience Remarks', 
+                            'Other Probability', 'Other Remarks', 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
+                            'Internal Project Title', 'Internal Projects Techstacks', 'External Project Title', 'External Projects Techstacks'
                         ]
+
+                        # Add dynamic GitHub columns if GitHub Skills were provided
+                        if github_skills.strip():
+                            input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
+                            dynamic_gh_cols = []
+                            for tech in input_techs:
+                                dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
+                            display_columns.extend(['GitHub Screening Outcome', 'Profile Used', 'Ownership'] + dynamic_gh_cols + ['GitHub Average Probability'])
+
+                        if st.session_state.enable_lp_metrics:
+                            display_columns.extend(LP_COLUMNS)
 
                         process_resumes_in_batches_live(
                             df=df_input, batch_size=st.session_state.batch_size, 
                             worker_function=process_resume_for_shortlisting,
                             display_columns=display_columns, 
                             user_requirements=user_requirements.strip(), 
-                            company_name=company_name.strip()
+                            company_name=company_name.strip(),
+                            lp_dfs=lp_dfs_dict,
+                            skills_required_list=parsed_skills_list,
+                            github_skills=github_skills.strip()
+                        )
+
+                    elif is_github_only:
+                        # --- 2. PURE GITHUB ANALYSIS MODE ---
+                        st.session_state.last_analysis_mode = "GitHub Analysis"
+                        input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
+                        dynamic_gh_cols = []
+                        for tech in input_techs:
+                            dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
+                            
+                        display_columns = ['User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership'] + dynamic_gh_cols + ['GitHub Average Probability']
+
+                        if st.session_state.enable_lp_metrics:
+                            display_columns.extend(LP_COLUMNS)
+
+                        process_resumes_in_batches_live(
+                            df=df_input, batch_size=st.session_state.batch_size,
+                            worker_function=process_resume_for_github_analysis,
+                            display_columns=display_columns,
+                            github_skills=github_skills.strip(),
+                            company_name=company_name.strip(),
+                            lp_dfs=lp_dfs_dict,
+                            skills_required_list=parsed_skills_list
                         )
                     else:
+                        # --- 3. COMPREHENSIVE EXTRACTION MODES (FALLBACK) ---
                         st.session_state.last_analysis_mode = analysis_type
-
-                        if analysis_type == "GitHub Analysis":
-                            # --- 2. NEW GITHUB ANALYSIS MODE ---
-                            input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
-                            dynamic_gh_cols = []
-                            for tech in input_techs:
-                                dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
-                                
-                            display_columns = [
-                                'User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership'
-                            ] + dynamic_gh_cols + ['GitHub Average Probability']
-
-                            process_resumes_in_batches_live(
-                                df=df_input, batch_size=st.session_state.batch_size,
-                                worker_function=process_resume_for_github_analysis,
-                                display_columns=display_columns,
-                                github_skills=github_skills.strip(),
-                                company_name=company_name.strip()
-                            )
-                        elif analysis_type == "Internal Projects Matching":
-                            # --- 3. INTERNAL PROJECTS MODE ---
+                        if analysis_type == "Internal Projects Matching":
                             display_columns = [
                                 'User ID', 'Resume Link', 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-                                'Internal Project Titles', 'Internal Project Techstacks',
-                                'External Project Titles', 'External Project Techstacks'
+                                'Internal Project Titles', 'Internal Project Techstacks', 'External Project Titles', 'External Project Techstacks'
                             ]
-                            process_resumes_in_batches_live(
-                                df=df_input, batch_size=st.session_state.batch_size,
-                                worker_function=process_resume_comprehensively,
-                                display_columns=display_columns,
-                                analysis_type=analysis_type,
-                                company_name=company_name.strip()
-                            )
                         else:
-                            # --- 4. COMPREHENSIVE EXTRACTION MODES ---
-                            all_extraction_columns = [
+                            display_columns = [
                                 'User ID', 'Resume Link', 'Full Name', 'Mobile Number', 'Email ID',
                                 'LinkedIn Link', 'GitHub Link', 'GitHub Repo Count', 'Other Links', 'City', 'State',
-                                'Years of IT Experience', 'Years of Non-IT Experience',
-                                'Highest Education Institute Name', 'Skills'
+                                'Years of IT Experience', 'Years of Non-IT Experience', 'Highest Education Institute Name', 'Skills'
                             ] + SKILL_COLUMNS + [
                                 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-                                'Internal Project Title', 'Internal Projects Techstacks',
-                                'External Project Title', 'External Projects Techstacks',
-                                'Latest Experience Company Name', 'Latest Experience Job Title',
-                                'Latest Experience Start Date', 'Latest Experience End Date', 'Currently Working? (Yes/No)',
+                                'Internal Project Title', 'Internal Projects Techstacks', 'External Project Title', 'External Projects Techstacks',
+                                'Latest Experience Company Name', 'Latest Experience Job Title', 'Latest Experience Start Date', 'Latest Experience End Date', 'Currently Working? (Yes/No)',
                                 'Certifications', 'Awards', 'Achievements',
                             ]
-                            process_resumes_in_batches_live(
-                                df=df_input, batch_size=st.session_state.batch_size,
-                                worker_function=process_resume_comprehensively,
-                                display_columns=all_extraction_columns,
-                                analysis_type=analysis_type,
-                                company_name=company_name.strip()
-                            )
+                            
+                        process_resumes_in_batches_live(
+                            df=df_input, batch_size=st.session_state.batch_size,
+                            worker_function=process_resume_comprehensively,
+                            display_columns=display_columns,
+                            analysis_type=analysis_type,
+                            company_name=company_name.strip()
+                        )
                             
                 st.session_state.analysis_running = False
 
     if st.session_state.comprehensive_results:
         st.markdown("---")
         final_df = pd.DataFrame(st.session_state.comprehensive_results).fillna("")
-        
+        LP_COLUMNS = ['Course Summary Score', 'Performance Score', 'User Overall Score', 'Placement Match Score', 'LP Overall Score']
+
         if st.session_state.last_analysis_mode == "shortlisting":
             prob_cols = ['Overall Probability', 'Projects Probability', 'Skills Probability', 'Experience Probability', 'Other Probability']
             numeric_cols = ['Total Projects Count', 'Internal Projects Count', 'External Projects Count']
@@ -1626,21 +1973,27 @@ def main():
                 final_df['Priority Band'] = pd.Categorical(final_df['Priority Band'], categories=band_order, ordered=True)
                 display_cols = base_display_cols.copy()
                 display_cols.insert(3, 'Priority Band')
-                display_cols.extend(['Company Name', 'Analysis Datetime'])
                 final_df_ordered = final_df.sort_values(by=['Priority Band', 'Overall Probability'], ascending=[True, False])
             else:
                 display_cols = base_display_cols.copy()
-                display_cols.extend(['Company Name', 'Analysis Datetime'])
                 final_df_ordered = final_df.sort_values(by='Overall Probability', ascending=False)
+            
+            # Safely Append GitHub columns if they exist
+            gh_related_cols = ['GitHub Screening Outcome', 'Profile Used', 'Ownership', 'GitHub Average Probability']
+            dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
+            for col in gh_related_cols + dynamic_cols:
+                if col in final_df.columns: display_cols.append(col)
+
+            display_cols.extend(LP_COLUMNS)
+            display_cols.extend(['Company Name', 'Analysis Datetime'])
             
             final_df_ordered = final_df_ordered.reindex(columns=[col for col in display_cols if col in final_df_ordered.columns], fill_value='')
             file_name = f"resume_shortlist_{st.session_state.shortlisting_mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
         elif st.session_state.last_analysis_mode == "GitHub Analysis":
             base_gh_cols = ['User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership']
-            # Find the dynamic tech-related columns created during generation
             dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
-            final_column_order = base_gh_cols + dynamic_cols + ['GitHub Average Probability', 'Company Name', 'Analysis Datetime']
+            final_column_order = base_gh_cols + dynamic_cols + ['GitHub Average Probability'] + LP_COLUMNS + ['Company Name', 'Analysis Datetime']
             final_df_ordered = final_df.reindex(columns=[col for col in final_column_order if col in final_df.columns], fill_value='')
             file_name = f"github_analysis_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
