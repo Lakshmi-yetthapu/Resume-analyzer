@@ -1133,6 +1133,10 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
     user_id = row['user_id']
     resume_link = row['Resume link']
     github_skills = kwargs.get('github_skills', '').strip()
+    lp_dfs = kwargs.get('lp_dfs')
+    skills_required_list = kwargs.get('skills_required_list', [])
+    shortlisting_mode = kwargs.get('shortlisting_mode', "Probability Wise (Default)")
+    enable_probability_enrichment = shortlisting_mode == "Probability Wise (Default)"
 
     result = {
         'User ID': user_id,
@@ -1161,14 +1165,14 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
     }
 
     # Pre-fill dynamic GitHub columns if github skills are provided
-    if github_skills.strip():
+    if enable_probability_enrichment and github_skills.strip():
         input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
         for tech in input_techs:
             result[f"{tech}_Projects"] = "N/A"
             result[f"{tech}_Score"] = 0
 
     # Initialize GitHub Columns if required so they always show up correctly
-    if github_skills:
+    if enable_probability_enrichment and github_skills:
         result['GitHub Screening Outcome'] = 'Not Evaluated'
         result['Profile Used'] = 'None'
         result['Ownership'] = 'N/A'
@@ -1187,7 +1191,7 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
         logger.info(f"Shortlisting resume #{resume_index + 1} for user {user_id}.")
 
         # 1. Evaluate Learning Portal Metrics if DataFrames are provided
-        if lp_dfs:
+        if enable_probability_enrichment and lp_dfs:
             lp_metrics = get_learning_portal_metrics(
                 user_id=user_id,
                 skills_required=skills_required_list or [],
@@ -1225,7 +1229,7 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
             raise ValueError("Could not extract any text from the file.")
 
         # --- NEW: COMBINED GITHUB ANALYSIS ---
-        if github_skills.strip():
+        if enable_probability_enrichment and github_skills.strip():
             result['GitHub Screening Outcome'] = 'Processing'
             try:
                 gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
@@ -1368,7 +1372,7 @@ Return your answer as a **single, pure JSON object**.
         # ==============================================================================
         # DYNAMIC COMBINED GITHUB ANALYSIS LOGIC
         # ==============================================================================
-        if github_skills:
+        if enable_probability_enrichment and github_skills:
             gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
             
             # Safely grab the AI's project probability
@@ -1891,9 +1895,16 @@ def main():
 
                 st.write("")
                 st.subheader("Step 4: Start Analysis")
-                
+
+                is_shortlisting = bool(user_requirements.strip())
                 shortlisting_options = ["Probability Wise (Default)", "Priority Wise (P1 / P2 / P3 Bands)"]
-                shortlisting_mode = st.selectbox("Choose Shortlisting Mode", options=shortlisting_options, index=1) if is_shortlisting else "N/A"
+                default_shortlisting_mode = st.session_state.get('shortlisting_mode', "Probability Wise (Default)")
+                default_shortlisting_index = shortlisting_options.index(default_shortlisting_mode) if default_shortlisting_mode in shortlisting_options else 0
+                shortlisting_mode = st.selectbox(
+                    "Choose Shortlisting Mode",
+                    options=shortlisting_options,
+                    index=default_shortlisting_index
+                ) if is_shortlisting else "N/A"
                 
                 st.write("")
                 button_text = f"🚀 Start Analysis for {len(df_input)} Resumes"
@@ -1916,6 +1927,19 @@ def main():
 
                 st.session_state.analysis_running = True
                 LP_COLUMNS = ['Course Summary Score', 'Performance Score', 'User Overall Score', 'Placement Match Score', 'LP Overall Score']
+                is_probability_shortlisting = is_shortlisting and shortlisting_mode == "Probability Wise (Default)"
+                should_run_github_enrichment = is_probability_shortlisting and analysis_type == "GitHub Analysis" and github_skills.strip()
+                should_fetch_lp_metrics = st.session_state.enable_lp_metrics and (
+                    is_probability_shortlisting or (not is_shortlisting and analysis_type == "GitHub Analysis")
+                )
+                parsed_skills_list = []
+                relevant_courses = []
+                lp_dfs_dict = None
+
+                if should_fetch_lp_metrics:
+                    lp_skill_source = github_skills.strip() if github_skills.strip() else user_requirements.strip()
+                    parsed_skills_list, relevant_courses = parse_skills_from_config(lp_skill_source)
+                    lp_dfs_dict = fetch_all_metrics(df_input['user_id'].tolist(), relevant_courses)
 
                 with live_results_container:
                     if user_requirements.strip():
@@ -1938,61 +1962,75 @@ def main():
                             'External Project Title', 'External Projects Techstacks'
                         ]
 
+                        if should_run_github_enrichment:
+                            input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
+                            dynamic_gh_cols = []
+                            for tech in input_techs:
+                                dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
+                            display_columns += ['GitHub Screening Outcome', 'Profile Used', 'Ownership'] + dynamic_gh_cols + ['GitHub Average Probability', 'Combined Git & Project Probability', 'Combined Git & Project Remarks']
+
+                        if is_probability_shortlisting and lp_dfs_dict:
+                            display_columns += LP_COLUMNS
+
                         process_resumes_in_batches_live(
                             df=df_input, batch_size=st.session_state.batch_size, 
                             worker_function=process_resume_for_shortlisting,
                             display_columns=display_columns, 
                             user_requirements=user_requirements.strip(), 
-                            company_name=company_name.strip()
+                            company_name=company_name.strip(),
+                            github_skills=github_skills.strip() if should_run_github_enrichment else "",
+                            lp_dfs=lp_dfs_dict if is_probability_shortlisting else None,
+                            skills_required_list=parsed_skills_list if is_probability_shortlisting else [],
+                            shortlisting_mode=shortlisting_mode
                         )
-
+                    else:
+                        # --- 2. COMPREHENSIVE EXTRACTION / ISOLATED GITHUB MODES ---
                         if analysis_type == "GitHub Analysis":
-                            # --- 2. NEW GITHUB ANALYSIS MODE ---
+                            st.session_state.last_analysis_mode = "Isolated GitHub Analysis"
                             input_techs = [t.strip().upper() for t in re.split(r'[,\s/]+', github_skills.strip()) if t.strip()]
                             dynamic_gh_cols = []
                             for tech in input_techs:
                                 dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
-                                
+
                             display_columns = [
                                 'User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership'
-                            ] + dynamic_gh_cols + ['GitHub Average Probability']
+                            ] + dynamic_gh_cols + ['GitHub Average Probability'] + (LP_COLUMNS if lp_dfs_dict else [])
 
-                        process_resumes_in_batches_live(
-                            df=df_input, batch_size=st.session_state.batch_size,
-                            worker_function=process_resume_for_github_analysis,
-                            display_columns=display_columns,
-                            github_skills=github_skills.strip(),
-                            company_name=company_name.strip(),
-                            lp_dfs=lp_dfs_dict,
-                            skills_required_list=parsed_skills_list
-                        )
-                    else:
-                        # --- 3. COMPREHENSIVE EXTRACTION MODES (FALLBACK) ---
-                        st.session_state.last_analysis_mode = analysis_type
-                        if analysis_type == "Internal Projects Matching":
-                            display_columns = [
-                                'User ID', 'Resume Link', 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-                                'Internal Project Titles', 'Internal Project Techstacks', 'External Project Titles', 'External Project Techstacks'
-                            ]
+                            process_resumes_in_batches_live(
+                                df=df_input, batch_size=st.session_state.batch_size,
+                                worker_function=process_resume_for_github_analysis,
+                                display_columns=display_columns,
+                                github_skills=github_skills.strip(),
+                                company_name=company_name.strip(),
+                                lp_dfs=lp_dfs_dict,
+                                skills_required_list=parsed_skills_list
+                            )
                         else:
-                            display_columns = [
-                                'User ID', 'Resume Link', 'Full Name', 'Mobile Number', 'Email ID',
-                                'LinkedIn Link', 'GitHub Link', 'GitHub Repo Count', 'Other Links', 'City', 'State',
-                                'Years of IT Experience', 'Years of Non-IT Experience', 'Highest Education Institute Name', 'Skills'
-                            ] + SKILL_COLUMNS + [
-                                'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
-                                'Internal Project Title', 'Internal Projects Techstacks', 'External Project Title', 'External Projects Techstacks',
-                                'Latest Experience Company Name', 'Latest Experience Job Title', 'Latest Experience Start Date', 'Latest Experience End Date', 'Currently Working? (Yes/No)',
-                                'Certifications', 'Awards', 'Achievements',
-                            ]
-                            
-                        process_resumes_in_batches_live(
-                            df=df_input, batch_size=st.session_state.batch_size,
-                            worker_function=process_resume_comprehensively,
-                            display_columns=display_columns,
-                            analysis_type=analysis_type,
-                            company_name=company_name.strip()
-                        )
+                            st.session_state.last_analysis_mode = analysis_type
+                            if analysis_type == "Internal Projects Matching":
+                                display_columns = [
+                                    'User ID', 'Resume Link', 'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
+                                    'Internal Project Titles', 'Internal Project Techstacks', 'External Project Titles', 'External Project Techstacks'
+                                ]
+                            else:
+                                display_columns = [
+                                    'User ID', 'Resume Link', 'Full Name', 'Mobile Number', 'Email ID',
+                                    'LinkedIn Link', 'GitHub Link', 'GitHub Repo Count', 'Other Links', 'City', 'State',
+                                    'Years of IT Experience', 'Years of Non-IT Experience', 'Highest Education Institute Name', 'Skills'
+                                ] + SKILL_COLUMNS + [
+                                    'Total Projects Count', 'Internal Projects Count', 'External Projects Count',
+                                    'Internal Project Title', 'Internal Projects Techstacks', 'External Project Title', 'External Projects Techstacks',
+                                    'Latest Experience Company Name', 'Latest Experience Job Title', 'Latest Experience Start Date', 'Latest Experience End Date', 'Currently Working? (Yes/No)',
+                                    'Certifications', 'Awards', 'Achievements',
+                                ]
+                                
+                            process_resumes_in_batches_live(
+                                df=df_input, batch_size=st.session_state.batch_size,
+                                worker_function=process_resume_comprehensively,
+                                display_columns=display_columns,
+                                analysis_type=analysis_type,
+                                company_name=company_name.strip()
+                            )
                             
                 st.session_state.analysis_running = False
 
