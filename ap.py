@@ -929,13 +929,23 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
     headers = {"Accept": "application/vnd.github.v3+json"}
     token, _ = resolve_github_token()
     if token: headers["Authorization"] = f"Bearer {token}"
-        
+
     try:
+        total_public_repos = 0
+        try:
+            user_resp = requests.get(f"https://api.github.com/users/{username}", headers=headers, timeout=10)
+            if user_resp.status_code == 200:
+                total_public_repos = int(user_resp.json().get('public_repos', 0) or 0)
+        except Exception:
+            total_public_repos = 0
+
         repo_resp = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated", headers=headers, timeout=15)
         if repo_resp.status_code != 200:
-            return {"found": False, "error": f"GitHub API Error: {repo_resp.status_code}"}
-        
+            return {"found": False, "error": f"GitHub API Error: {repo_resp.status_code}", "total_public_repos": total_public_repos}
+
         repos = repo_resp.json()
+        if not total_public_repos:
+            total_public_repos = len(repos) if isinstance(repos, list) else 0
 
         for repo in repos:
             if all(data["score"] == 100 for data in tech_results.values()):
@@ -1022,7 +1032,8 @@ def analyze_github_repositories(username: str, required_tech: str) -> Dict[str, 
             "tech_details": tech_results,
             "github_average_probability": int(avg_score),
             "match_count": sum(1 for d in tech_results.values() if d["score"] > 0),
-            "commits_verified": any(d["score"] > 0 for d in tech_results.values())
+            "commits_verified": any(d["score"] > 0 for d in tech_results.values()),
+            "total_public_repos": total_public_repos
         }
     except Exception as e:
         return {"found": False, "error": str(e)}
@@ -1041,6 +1052,7 @@ def process_resume_for_github_analysis(row, resume_index, github_skills, company
         'GitHub Screening Outcome': 'Error Processing',
         'Profile Used': 'None',
         'Ownership': 'N/A',
+        'GitHub Repo Count': 0,
         'GitHub Average Probability': 0,
         'Company Name': company_name,
         # Defaulting Learning Portal metric columns
@@ -1100,14 +1112,15 @@ def process_resume_for_github_analysis(row, resume_index, github_skills, company
         
         if gh_info.get("github_found") and gh_info.get("github_username"):
             gh_analysis = analyze_github_repositories(gh_info["github_username"], github_skills)
-            
+            result['GitHub Repo Count'] = gh_analysis.get("total_public_repos", 0)
+
             if gh_analysis.get("found"):
                 details = gh_analysis.get("tech_details", {})
                 for tech, data in details.items():
                     col_prefix = tech.upper()
                     result[f"{col_prefix}_Projects"] = "\n".join(data["projects"]) if data["projects"] else "N/A"
                     result[f"{col_prefix}_Score"] = data["score"]
-                
+
                 result['GitHub Average Probability'] = gh_analysis.get("github_average_probability", 0)
                 result['GitHub Screening Outcome'] = "Analysis Complete"
                 result['Ownership'] = "Yes (Verified)" if gh_analysis.get("commits_verified") else "No"
@@ -1161,6 +1174,7 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
         'GitHub Screening Outcome': 'Skipped',
         'Profile Used': 'None',
         'Ownership': 'N/A',
+        'GitHub Repo Count': 0,
         'GitHub Average Probability': 0
     }
 
@@ -1176,6 +1190,7 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
         result['GitHub Screening Outcome'] = 'Not Evaluated'
         result['Profile Used'] = 'None'
         result['Ownership'] = 'N/A'
+        result['GitHub Repo Count'] = 0
         result['GitHub Average Probability'] = 0
         result['Combined Git & Project Probability'] = 0
         result['Combined Git & Project Remarks'] = 'Not Evaluated'
@@ -1235,6 +1250,7 @@ def process_resume_for_shortlisting(row, resume_index, user_requirements, compan
                 gh_info = extract_github_info_via_ai(resume_text, clickable_links, api_key)
                 if gh_info.get("github_found") and gh_info.get("github_username"):
                     gh_analysis = analyze_github_repositories(gh_info["github_username"], github_skills)
+                    result['GitHub Repo Count'] = gh_analysis.get("total_public_repos", 0)
                     if gh_analysis.get("found"):
                         details = gh_analysis.get("tech_details", {})
                         for tech, data in details.items():
@@ -1384,7 +1400,8 @@ Return your answer as a **single, pure JSON object**.
 
             if gh_info.get("github_found") and gh_info.get("github_username"):
                 gh_analysis = analyze_github_repositories(gh_info["github_username"], github_skills)
-                
+                result['GitHub Repo Count'] = gh_analysis.get("total_public_repos", 0)
+
                 if gh_analysis.get("found"):
                     details = gh_analysis.get("tech_details", {})
                     for tech, tech_data in details.items():
@@ -1967,7 +1984,7 @@ def main():
                             dynamic_gh_cols = []
                             for tech in input_techs:
                                 dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
-                            display_columns += ['GitHub Screening Outcome', 'Profile Used', 'Ownership'] + dynamic_gh_cols + ['GitHub Average Probability', 'Combined Git & Project Probability', 'Combined Git & Project Remarks']
+                            display_columns += ['GitHub Screening Outcome', 'Profile Used', 'Ownership', 'GitHub Repo Count'] + dynamic_gh_cols + ['GitHub Average Probability', 'Combined Git & Project Probability', 'Combined Git & Project Remarks']
 
                         if is_probability_shortlisting and lp_dfs_dict:
                             display_columns += LP_COLUMNS
@@ -1993,7 +2010,7 @@ def main():
                                 dynamic_gh_cols.extend([f"{tech}_Projects", f"{tech}_Score"])
 
                             display_columns = [
-                                'User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership'
+                                'User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership', 'GitHub Repo Count'
                             ] + dynamic_gh_cols + ['GitHub Average Probability'] + (LP_COLUMNS if lp_dfs_dict else [])
 
                             process_resumes_in_batches_live(
@@ -2052,7 +2069,7 @@ def main():
             ]
             
             if 'GitHub Screening Outcome' in final_df.columns:
-                base_display_cols += ['GitHub Screening Outcome', 'Profile Used', 'Ownership']
+                base_display_cols += ['GitHub Screening Outcome', 'Profile Used', 'Ownership', 'GitHub Repo Count']
                 dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
                 base_display_cols += dynamic_cols + ['GitHub Average Probability']
                 
@@ -2077,21 +2094,15 @@ def main():
             else:
                 display_cols = base_display_cols.copy()
                 final_df_ordered = final_df.sort_values(by='Overall Probability', ascending=False)
-            
-            # Safely Append GitHub columns if they exist
-            gh_related_cols = ['GitHub Screening Outcome', 'Profile Used', 'Ownership', 'GitHub Average Probability']
-            dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
-            for col in gh_related_cols + dynamic_cols:
-                if col in final_df.columns: display_cols.append(col)
 
-            display_cols.extend(LP_COLUMNS)
-            display_cols.extend(['Company Name', 'Analysis Datetime'])
+            display_cols += [col for col in LP_COLUMNS if col in final_df.columns and col not in display_cols]
+            display_cols += [col for col in ['Company Name', 'Analysis Datetime'] if col in final_df.columns and col not in display_cols]
             
             final_df_ordered = final_df_ordered.reindex(columns=[col for col in display_cols if col in final_df_ordered.columns], fill_value='')
             file_name = f"resume_shortlist_{st.session_state.shortlisting_mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
         elif st.session_state.last_analysis_mode == "Isolated GitHub Analysis":
-            base_gh_cols = ['User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership']
+            base_gh_cols = ['User ID', 'Resume Link', 'GitHub Screening Outcome', 'Profile Used', 'Ownership', 'GitHub Repo Count']
             dynamic_cols = [c for c in final_df.columns if c.endswith("_Projects") or c.endswith("_Score")]
             final_column_order = base_gh_cols + dynamic_cols + ['GitHub Average Probability'] + LP_COLUMNS + ['Company Name', 'Analysis Datetime']
             final_df_ordered = final_df.reindex(columns=[col for col in final_column_order if col in final_df.columns], fill_value='')
